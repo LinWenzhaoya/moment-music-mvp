@@ -1,0 +1,36 @@
+import type { Track } from "../lib/music";
+
+const rows: Array<Omit<Track, "id">> = [
+  { title:"Midnight City", artist:"M83", genre:"Electronic", kind:"familiar", energy:78, vocal:42, tags:["电子","渐进","愉快","夜晚"], instruments:["合成器","鼓点"], color:"violet" },
+  { title:"Kerala", artist:"Bonobo", genre:"Downtempo", kind:"familiar", energy:60, vocal:18, tags:["鼓点","电子","专注"], instruments:["鼓点","采样"], color:"green" },
+  { title:"Experience", artist:"Ludovico Einaudi", genre:"Modern Classical", kind:"familiar", energy:68, vocal:0, tags:["弦乐","钢琴","渐进"], instruments:["钢琴","弦乐"], color:"orange" },
+  { title:"A Moment Apart", artist:"ODESZA", genre:"Electronic", kind:"familiar", energy:74, vocal:22, tags:["电子","鼓点","渐进"], instruments:["合成器","鼓点"], color:"blue" },
+  { title:"Intro", artist:"The xx", genre:"Indie", kind:"familiar", energy:45, vocal:0, tags:["专注","夜晚","鼓点"], instruments:["吉他","鼓点"], color:"charcoal" },
+  { title:"Sunset Lover", artist:"Petit Biscuit", genre:"Electronic", kind:"familiar", energy:52, vocal:15, tags:["愉快","电子","专注"], instruments:["合成器"], color:"peach" },
+  { title:"Cornfield Chase", artist:"Hans Zimmer", genre:"Soundtrack", kind:"familiar", energy:62, vocal:0, tags:["渐进","弦乐","专注"], instruments:["管风琴","弦乐"], color:"gold" },
+  { title:"Awake", artist:"Tycho", genre:"Ambient", kind:"familiar", energy:57, vocal:0, tags:["专注","电子","空灵"], instruments:["合成器","吉他"], color:"cyan" },
+  { title:"Go", artist:"The Chemical Brothers", genre:"Electronic", kind:"familiar", energy:91, vocal:35, tags:["运动","鼓点","电子"], instruments:["鼓点","合成器"], color:"red" },
+  { title:"Time", artist:"Hans Zimmer", genre:"Soundtrack", kind:"familiar", energy:70, vocal:0, tags:["弦乐","渐进","专注"], instruments:["弦乐","钢琴"], color:"sand" },
+  { title:"Your Hand in Mine", artist:"Explosions in the Sky", genre:"Post-rock", kind:"forgotten", energy:66, vocal:0, tags:["渐进","专注","夜晚"], instruments:["吉他","鼓点"], color:"blue", lastPlayed:"14 个月" },
+  { title:"Divenire", artist:"Ludovico Einaudi", genre:"Modern Classical", kind:"forgotten", energy:72, vocal:0, tags:["钢琴","弦乐","渐进"], instruments:["钢琴","弦乐"], color:"orange", lastPlayed:"11 个月" },
+  { title:"We Own the Sky", artist:"M83", genre:"Electronic", kind:"forgotten", energy:76, vocal:58, tags:["电子","空灵","夜晚"], instruments:["合成器","鼓点"], color:"violet", lastPlayed:"18 个月" },
+  { title:"Cirrus", artist:"Bonobo", genre:"Electronic", kind:"forgotten", energy:69, vocal:8, tags:["鼓点","电子","专注"], instruments:["鼓点","木琴"], color:"green", lastPlayed:"9 个月" },
+  { title:"Says", artist:"Nils Frahm", genre:"Modern Classical", kind:"forgotten", energy:64, vocal:0, tags:["渐进","电子","专注"], instruments:["合成器","钢琴"], color:"charcoal", lastPlayed:"16 个月" },
+  { title:"Dayvan Cowboy", artist:"Boards of Canada", genre:"Electronic", kind:"forgotten", energy:59, vocal:0, tags:["空灵","电子","夜晚"], instruments:["合成器","鼓点"], color:"cyan", lastPlayed:"2 年" },
+  { title:"Near Light", artist:"Ólafur Arnalds", genre:"Modern Classical", kind:"forgotten", energy:50, vocal:0, tags:["弦乐","空灵","专注"], instruments:["弦乐","电子"], color:"sand", lastPlayed:"13 个月" },
+  { title:"Opal", artist:"Bicep", genre:"Electronic", kind:"discover", energy:81, vocal:14, tags:["鼓点","电子","渐进"], instruments:["鼓点","合成器"], color:"blue" },
+  { title:"Glue", artist:"Bicep", genre:"Electronic", kind:"discover", energy:77, vocal:18, tags:["电子","鼓点","夜晚"], instruments:["鼓点","合成器"], color:"violet" },
+  { title:"Luminous Beings", artist:"Jon Hopkins", genre:"Electronic", kind:"discover", energy:72, vocal:0, tags:["渐进","电子","空灵"], instruments:["合成器","鼓点"], color:"cyan" },
+  { title:"Kusanagi", artist:"ODESZA", genre:"Electronic", kind:"discover", energy:56, vocal:0, tags:["电子","专注","空灵"], instruments:["合成器","鼓点"], color:"green" },
+  { title:"Andata", artist:"Ryuichi Sakamoto", genre:"Modern Classical", kind:"discover", energy:35, vocal:0, tags:["钢琴","专注","空灵"], instruments:["钢琴","电子"], color:"sand" },
+  { title:"Particles", artist:"Nils Frahm", genre:"Modern Classical", kind:"discover", energy:58, vocal:0, tags:["钢琴","电子","渐进"], instruments:["钢琴","合成器"], color:"charcoal" },
+  { title:"Saman", artist:"Ólafur Arnalds", genre:"Modern Classical", kind:"discover", energy:39, vocal:0, tags:["弦乐","钢琴","专注"], instruments:["弦乐","钢琴"], color:"orange" },
+  { title:"Atlas", artist:"Lane 8", genre:"Electronic", kind:"discover", energy:75, vocal:10, tags:["电子","渐进","愉快"], instruments:["合成器","鼓点"], color:"peach" },
+  { title:"Migration", artist:"Bonobo", genre:"Electronic", kind:"discover", energy:65, vocal:12, tags:["鼓点","电子","专注"], instruments:["鼓点","弦乐"], color:"green" },
+  { title:"Aria Math", artist:"C418", genre:"Ambient", kind:"discover", energy:48, vocal:0, tags:["专注","电子","空灵"], instruments:["合成器","钢琴"], color:"cyan" },
+  { title:"In Motion", artist:"Trent Reznor & Atticus Ross", genre:"Soundtrack", kind:"discover", energy:84, vocal:0, tags:["鼓点","渐进","专注"], instruments:["鼓点","电子"], color:"red" },
+  { title:"Hammers", artist:"Nils Frahm", genre:"Modern Classical", kind:"discover", energy:71, vocal:0, tags:["钢琴","鼓点","渐进"], instruments:["钢琴","鼓点"], color:"gold" },
+  { title:"Outro", artist:"M83", genre:"Electronic", kind:"discover", energy:73, vocal:30, tags:["电子","渐进","弦乐"], instruments:["弦乐","合成器"], color:"violet" },
+];
+
+export const demoTracks: Track[] = rows.map((track, index) => ({ ...track, id: `track-${index + 1}` }));
