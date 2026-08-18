@@ -1,12 +1,18 @@
 {
-  "name": "site-creator-vinext-starter",
+  "name": "moment-music-mvp",
   "version": "0.1.0",
   "private": true,
+  "description": "A local-first, LLM-assisted personalized music recommendation MVP.",
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
+    "dev": "node scripts/dev-local.mjs",
+    "dev:web": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
+    "music:server": "node local-music/server.mjs",
+    "similarity:calibrate": "node scripts/calibrate-similarity.mjs",
+    "profiles:complete": "node scripts/complete-experience-profiles.mjs",
+    "profiles:repair": "PROFILE_REPAIR=1 node scripts/complete-experience-profiles.mjs",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
@@ -15,6 +21,7 @@
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
+    "music-metadata": "^11.14.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },

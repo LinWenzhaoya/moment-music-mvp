@@ -30,6 +30,23 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+local-music/*.sqlite
+local-music/*.sqlite3
+local-music/*.sqlite-shm
+local-music/*.sqlite-wal
+local-music/*.db
+local-music/*.db-shm
+local-music/*.db-wal
+
+# local music library (audio is intentionally not distributed)
+/music-repo/
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.wav
+*.ogg
 
 # vercel
 .vercel

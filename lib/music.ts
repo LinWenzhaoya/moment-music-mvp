@@ -1,4 +1,4 @@
-export type TrackKind = "familiar" | "forgotten" | "discover";
+export type TrackKind = "familiar" | "forgotten" | "discover" | "library";
 
 export type Track = {
   id: string;
@@ -12,6 +12,13 @@ export type Track = {
   instruments: string[];
   color: string;
   lastPlayed?: string;
+  audioUrl?: string;
+  duration?: number;
+  bitrate?: number;
+  album?: string | null;
+  folder?: string;
+  playCount?: number;
+  lastPlayedAt?: string | null;
 };
 
 export type Intent = {
@@ -28,14 +35,17 @@ export type Mix = {
 };
 
 export type Preference = {
+  id?: number;
   tag: string;
   weight: number;
   reason: string;
+  evidenceCount?: number;
 };
 
 export type RecommendedTrack = Track & {
   score: number;
   reason: string;
+  evidence?: string[];
 };
 
 const KEYWORDS: Array<[string[], string]> = [
@@ -99,6 +109,11 @@ export function recommend(tracks: Track[], text: string, mix: Mix, count: number
   const selected = (["familiar", "forgotten", "discover"] as TrackKind[]).flatMap((kind) =>
     scored.filter((track) => track.kind === kind).sort((a, b) => b.score - a.score).slice(0, desired[kind]),
   );
+
+  if (selected.length < count) {
+    const selectedIds = new Set(selected.map((track) => track.id));
+    selected.push(...scored.filter((track) => !selectedIds.has(track.id)).sort((a, b) => b.score - a.score).slice(0, count - selected.length));
+  }
 
   return { intent, tracks: selected.sort((a, b) => b.score - a.score) };
 }
