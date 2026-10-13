@@ -1,0 +1,25 @@
+{
+  "note": "真实场景测试句。每条跑两版向量（desc=只用描述，rich=描述+情绪/歌词主题/场景），盲测对比；比例由系统按情境决定，两版共用同一比例。",
+  "queries": [
+    { "id": "breakup", "type": "情绪", "text": "刚失恋，心里很难受，想听点歌" },
+    { "id": "offer", "type": "事件+风格", "text": "我刚拿到一个校招offer，非常激动，想听古典、激昂的音乐" },
+    { "id": "tired", "type": "情绪", "text": "今天加班到很晚，特别累，想听点不费脑子的" },
+    { "id": "night-drive", "type": "场景", "text": "深夜一个人开车回家，想要有点氛围感的歌" },
+    { "id": "rainy-reading", "type": "场景", "text": "下雨天窝在家里看书，来点安静的背景音乐" },
+    { "id": "cantonese-old", "type": "硬条件", "text": "来点粤语老歌" },
+    { "id": "focus-instrumental", "type": "硬条件", "text": "要纯音乐，帮我专注写代码" },
+    { "id": "gym-rap", "type": "场景+风格", "text": "去健身房撸铁，要燃一点的说唱" },
+    { "id": "like-nianlun", "type": "参考歌", "text": "想听像《年轮》那种感觉的歌" },
+    { "id": "breakup-familiar", "type": "指定比例", "text": "失恋了，八成要我听过的歌" },
+    { "id": "happy-not-loud", "type": "矛盾要求", "text": "想要欢快一点，但别太吵" },
+    { "id": "weekend-morning", "type": "场景+硬条件", "text": "周末早上起床，想听点轻松愉快的英文歌" },
+    { "id": "party-kpop", "type": "场景+风格", "text": "和朋友聚会，来点能一起嗨的K-Pop" },
+    { "id": "insomnia", "type": "情绪", "text": "有点焦虑，睡不着，想听点能让我平静下来的" },
+    { "id": "miss-friend", "type": "情绪", "text": "想念一个很久没联系的朋友" },
+    { "id": "exam-boost", "type": "事件", "text": "明天考试，给自己打打气" },
+    { "id": "lazy-rnb", "type": "硬条件+风格", "text": "来点女声R&B，慵懒一点" },
+    { "id": "forgotten-oldies", "type": "指定比例", "text": "想听点我很久没听过的歌" },
+    { "id": "payday", "type": "情绪+指定比例", "text": "发工资了心情很好，推荐点我没听过的" },
+    { "id": "birthday-alone", "type": "情绪", "text": "一个人在外地过生日，有点孤独" }
+  ]
+}

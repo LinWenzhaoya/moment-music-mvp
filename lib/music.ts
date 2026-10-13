@@ -18,6 +18,13 @@ export type Track = {
   album?: string | null;
   folder?: string;
   playCount?: number;
+  totalPlays?: number;
+  valence?: number | null;
+  arousal?: number | null;
+  chips?: string[];
+  language?: string | null;
+  instrumental?: boolean;
+  missing?: boolean;
   lastPlayedAt?: string | null;
 };
 
@@ -106,7 +113,7 @@ export function recommend(tracks: Track[], text: string, mix: Mix, count: number
   };
   desired.discover = Math.max(0, count - desired.familiar - desired.forgotten);
 
-  const selected = (["familiar", "forgotten", "discover"] as TrackKind[]).flatMap((kind) =>
+  const selected = (["familiar", "forgotten", "discover"] as const).flatMap((kind) =>
     scored.filter((track) => track.kind === kind).sort((a, b) => b.score - a.score).slice(0, desired[kind]),
   );
 

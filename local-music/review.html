@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moment 评测</title>
+<style>
+  :root { --bg:#4c5053; --card:#55595c; --ink:#f4f5f4; --muted:#c4c8c6; --line:#666a6d; --green:#3ddc97; --lime:#e7c35a; --red:#ff8a65; --amber:#e7b45a; --field:#5d6164; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 Figtree, -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; }
+  header { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:16px; padding:12px 20px; background:rgba(76,80,83,.96); border-bottom:1px solid var(--line); backdrop-filter:blur(6px); }
+  header h1 { margin:0; font-size:16px; }
+  .tabs button { border:1px solid var(--line); background:var(--field); color:var(--ink); padding:6px 14px; border-radius:20px; cursor:pointer; font-size:13px; }
+  .tabs button.on { background:var(--green); color:#0c2a1d; border-color:var(--green); }
+  .progress { margin-left:auto; color:var(--muted); font-size:12px; }
+  main { max-width:1180px; margin:0 auto; padding:20px 16px 80px; }
+  .hint { color:var(--muted); font-size:13px; margin:0 0 18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:18px; }
+  .q-head { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+  .q-head h2 { margin:0; font-size:17px; }
+  .chip { font-size:11px; padding:2px 8px; border-radius:10px; background:var(--field); color:var(--muted); }
+  .mix { color:var(--muted); font-size:12px; margin:4px 0 12px; }
+  .sides { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:800px) { .sides { grid-template-columns:1fr; } }
+  .side h3 { margin:0 0 8px; font-size:14px; }
+  .song { display:grid; grid-template-columns:30px 1fr auto; gap:8px; align-items:start; padding:8px 0; border-top:1px solid var(--line); }
+  .play { width:28px; height:28px; border-radius:50%; border:0; background:var(--green); color:#0c2a1d; cursor:pointer; font-size:11px; }
+  .play.playing { background:var(--amber); }
+  .title { font-weight:600; }
+  .artist, .kind { color:var(--muted); font-size:12px; }
+  .reason { color:var(--muted); font-size:12px; margin-top:2px; }
+  .scores button, .verdicts button, .pref button { border:1px solid var(--line); background:var(--field); color:var(--ink); border-radius:7px; padding:3px 8px; margin-left:3px; cursor:pointer; font-size:12px; }
+  .scores button.on[data-v="2"], .verdicts button.on[data-v="ok"] { background:var(--green); color:#0c2a1d; border-color:var(--green); }
+  .scores button.on[data-v="1"] { background:var(--lime); color:#2a1d02; border-color:var(--lime); }
+  .scores button.on[data-v="0"], .verdicts button.on[data-v="wrong"] { background:var(--red); color:#2b0b05; border-color:var(--red); }
+  .verdicts button.on[data-v="made_up"] { background:var(--amber); color:#2a1d02; border-color:var(--amber); }
+  .pref { margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .pref button.on { background:var(--green); color:#0c2a1d; border-color:var(--green); }
+  input.note { flex:1; min-width:180px; border:1px solid var(--line); border-radius:7px; padding:5px 8px; font:inherit; font-size:12px; background:var(--field); color:var(--ink); }
+  .field { display:grid; grid-template-columns:80px 1fr auto; gap:10px; padding:8px 0; border-top:1px solid var(--line); align-items:start; }
+  .field b { font-size:12px; color:var(--muted); font-weight:600; }
+  .err { color:var(--red); }
+  .player { position:fixed; left:0; right:0; bottom:0; z-index:10; display:none; align-items:center; gap:12px; padding:10px 20px; background:#2e3133; color:#f4f5f4; }
+  .player.on { display:flex; }
+  .player .now { min-width:0; flex:0 1 260px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:13px; }
+  .player .now small { opacity:.75; margin-left:6px; }
+  .player button { border:0; background:rgba(255,255,255,.16); color:#fff; border-radius:7px; padding:5px 10px; cursor:pointer; font-size:12px; }
+  .player input[type=range] { flex:1; accent-color:var(--green); }
+  .player .time { font-variant-numeric:tabular-nums; font-size:12px; opacity:.85; white-space:nowrap; }
+  .saved { color:var(--muted); font-size:11px; margin-left:6px; }
+  .fav { border:0; background:none; cursor:pointer; font-size:17px; line-height:1; color:var(--muted); padding:2px 4px; }
+  .fav.on { color:var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Moment 评测</h1>
+  <div class="tabs"><button data-tab="rec" class="on">推荐盲测</button> <button data-tab="tags">标签抽查</button></div>
+  <span class="progress" id="progress"></span>
+</header>
+<main id="main"></main>
+<div class="player" id="player">
+  <div class="now" id="now"></div>
+  <button id="back">−15s</button><button id="toggle">❚❚</button><button id="fwd">+15s</button>
+  <span class="time" id="cur">0:00</span><input type="range" id="seek" min="0" max="1000" value="0"><span class="time" id="dur">0:00</span>
+</div>
+<script>
+const api = (path, body) => fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}).then((r) => r.json());
+const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const kindText = { familiar: "近期熟悉", forgotten: "遗忘旧爱", library: "没听过" };
+const audio = new Audio();
+let playingButton = null;
+const $ = (id) => document.getElementById(id);
+const clock = (seconds) => Number.isFinite(seconds) ? `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}` : "0:00";
+let seeking = false;
+function setButton(button, playing) { if (button) { button.classList.toggle("playing", playing); button.textContent = playing ? "❚❚" : "▶"; } }
+function play(button) {
+  const id = button.dataset.play;
+  if (playingButton === button) { audio.paused ? audio.play() : audio.pause(); return; }
+  setButton(playingButton, false);
+  playingButton = button;
+  audio.src = `/api/tracks/${id}/audio`;
+  // Start past the intro so a song can be judged in a few seconds; the bar lets you go anywhere.
+  audio.onloadedmetadata = () => { if (audio.duration > 90) audio.currentTime = Math.min(60, audio.duration * 0.3); };
+  audio.play();
+  $("now").innerHTML = `${esc(button.dataset.title || "")}<small>${esc(button.dataset.artist || "")}</small>`;
+  $("player").classList.add("on");
+  document.body.style.paddingBottom = "56px";
+}
+audio.onplay = () => { setButton(playingButton, true); $("toggle").textContent = "❚❚"; };
+audio.onpause = () => { setButton(playingButton, false); $("toggle").textContent = "▶"; };
+audio.ontimeupdate = () => {
+  $("cur").textContent = clock(audio.currentTime); $("dur").textContent = clock(audio.duration);
+  if (!seeking && audio.duration) $("seek").value = Math.round((audio.currentTime / audio.duration) * 1000);
+};
+$("seek").oninput = () => { seeking = true; $("cur").textContent = clock((($("seek").value) / 1000) * audio.duration); };
+$("seek").onchange = () => { if (audio.duration) audio.currentTime = ($("seek").value / 1000) * audio.duration; seeking = false; };
+$("toggle").onclick = () => (audio.paused ? audio.play() : audio.pause());
+$("back").onclick = () => { audio.currentTime = Math.max(0, audio.currentTime - 15); };
+$("fwd").onclick = () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); };
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-play]");
+  if (button) play(button);
+});
+
+// Notes save on their own while you type (debounced), on blur, and when the page is closed or refreshed.
+const pendingNotes = new Map();
+function noteSaver(input, path, payload, onSaved) {
+  let timer = null;
+  const flush = () => {
+    clearTimeout(timer); timer = null;
+    if (!pendingNotes.has(input)) return;
+    pendingNotes.delete(input);
+    api(path, { ...payload, note: input.value }).then(onSaved);
+  };
+  input.addEventListener("input", () => {
+    pendingNotes.set(input, () => navigator.sendBeacon(path, new Blob([JSON.stringify({ ...payload, note: input.value })], { type: "application/json" })));
+    clearTimeout(timer); timer = setTimeout(flush, 600);
+  });
+  input.addEventListener("blur", flush);
+}
+window.addEventListener("pagehide", () => { for (const send of pendingNotes.values()) send(); pendingNotes.clear(); });
+const markSaved = (input) => () => { let tag = input.nextElementSibling; if (!tag?.classList?.contains("saved")) { tag = document.createElement("span"); tag.className = "saved"; input.after(tag); } tag.textContent = "已保存"; setTimeout(() => { tag.textContent = ""; }, 1500); };
+
+// Favorites are the app's "我喜欢的音乐" playlist; liking here also feeds the taste profile.
+let favorites = new Set();
+const loadFavorites = () => api("/api/eval/favorites").then((data) => { favorites = new Set(data.ids); });
+const favButton = (id) => `<button class="fav ${favorites.has(Number(id)) ? "on" : ""}" data-fav="${id}" title="收藏到“我喜欢的音乐”">${favorites.has(Number(id)) ? "♥" : "♡"}</button>`;
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-fav]");
+  if (!button) return;
+  const id = Number(button.dataset.fav);
+  const liked = !favorites.has(id);
+  await fetch(`/api/favorites/${id}`, { method: liked ? "PUT" : "DELETE" });
+  await loadFavorites();
+  document.querySelectorAll(`button[data-fav="${id}"]`).forEach((other) => { other.classList.toggle("on", liked); other.textContent = liked ? "♥" : "♡"; });
+});
+
+let tab = "rec";
+document.querySelectorAll(".tabs button").forEach((button) => button.onclick = () => {
+  tab = button.dataset.tab;
+  document.querySelectorAll(".tabs button").forEach((other) => other.classList.toggle("on", other === button));
+  render();
+});
+
+async function renderRec() {
+  const run = await api("/api/eval/latest");
+  const main = document.getElementById("main");
+  if (!run.queries?.length) { main.innerHTML = `<p class="hint">还没有评测结果。先运行 <code>node scripts/run-eval.mjs</code>。</p>`; return; }
+  const scores = new Map(run.ratings.map((r) => [`${r.query_id}|${r.side}|${r.track_id}`, r.score]));
+  const prefs = new Map(run.preferences.map((p) => [p.query_id, p]));
+  const chosen = () => [...prefs.values()].filter((p) => p.preferred).length;
+  const total = run.queries.reduce((sum, q) => sum + (q.sides ? q.sides.A.tracks.length + q.sides.B.tracks.length : 0), 0);
+  const updateProgress = () => { document.getElementById("progress").textContent = `已打分 ${scores.size}/${total} 首 · 已选边 ${chosen()}/${run.queries.length} 条`; };
+  updateProgress();
+  main.innerHTML = `<p class="hint">每条需求下有 A、B 两份歌单（哪份用了哪种检索方式是隐藏的）。逐首打分：<b>2</b> 很合适 · <b>1</b> 还行 · <b>0</b> 不合适；再选整体哪份更好。点 ▶ 从歌曲中段开始试听。</p>` +
+    run.queries.map((q) => q.error ? `<div class="card"><div class="q-head"><h2>${esc(q.text)}</h2></div><p class="err">运行失败：${esc(q.error)}</p></div>` : `
+    <div class="card" data-q="${esc(q.id)}">
+      <div class="q-head"><h2>${esc(q.text)}</h2><span class="chip">${esc(q.type)}</span></div>
+      <div class="mix">比例：熟悉 ${q.sides.A.mix?.familiar}% · 旧爱 ${q.sides.A.mix?.forgotten}% · 新歌 ${q.sides.A.mix?.discover}%（${esc(q.sides.A.mix?.reason || "")}）</div>
+      <div class="sides">${["A", "B"].map((side) => `<div class="side"><h3>歌单 ${side}</h3>${q.sides[side].tracks.map((t) => `
+        <div class="song">
+          <button class="play" data-play="${t.id}" data-title="${esc(t.title)}" data-artist="${esc(t.artist)}">▶</button>
+          <div><div class="title">${esc(t.title)}</div><div class="artist">${esc(t.artist)} · <span class="kind">${kindText[t.kind] || t.kind}</span></div><div class="reason">${esc(t.reason)}</div></div>
+          <div class="scores" data-side="${side}" data-track="${t.id}">${favButton(t.id)}${[2, 1, 0].map((v) => `<button data-v="${v}" class="${scores.get(`${q.id}|${side}|${t.id}`) === v ? "on" : ""}">${v}</button>`).join("")}</div>
+        </div>`).join("")}</div>`).join("")}</div>
+      <div class="pref"><span>整体哪份更好？</span>${[["A", "A 更好"], ["same", "差不多"], ["B", "B 更好"]].map(([v, label]) => `<button data-pref="${v}" class="${prefs.get(q.id)?.preferred === v ? "on" : ""}">${label}</button>`).join("")}<input class="note" placeholder="备注（可选）：哪首明显不对、缺了什么" value="${esc(prefs.get(q.id)?.note || "")}"></div>
+    </div>`).join("");
+  main.querySelectorAll(".card[data-q]").forEach((card) => {
+    const queryId = card.dataset.q;
+    card.querySelectorAll(".scores").forEach((group) => group.querySelectorAll("button[data-v]").forEach((button) => button.onclick = async () => {
+      await api("/api/eval/ratings", { runId: run.runId, queryId, side: group.dataset.side, trackId: Number(group.dataset.track), score: Number(button.dataset.v) });
+      group.querySelectorAll("button[data-v]").forEach((other) => other.classList.toggle("on", other === button));
+      scores.set(`${queryId}|${group.dataset.side}|${group.dataset.track}`, Number(button.dataset.v)); updateProgress();
+    }));
+    const note = card.querySelector("input.note");
+    const savePref = async (preferred) => {
+      await api("/api/eval/preference", { runId: run.runId, queryId, preferred });
+      card.querySelectorAll("[data-pref]").forEach((other) => other.classList.toggle("on", other.dataset.pref === preferred));
+      prefs.set(queryId, { ...(prefs.get(queryId) || {}), preferred }); updateProgress();
+    };
+    card.querySelectorAll("[data-pref]").forEach((button) => button.onclick = () => savePref(button.dataset.pref));
+    noteSaver(note, "/api/eval/preference", { runId: run.runId, queryId }, markSaved(note));
+  });
+}
+
+const fieldLabel = { language_vocal: "语言/人声/节奏", genre: "曲风", mood: "情绪", lyricTheme: "歌词主题", scene: "适合的处境", description: "综合描述" };
+function fieldValue(field, t) {
+  if (field === "language_vocal") return `${t.language || "?"} · ${t.vocalPresence || "?"} · ${t.vocalType || "?"} · 节奏${t.tempo || "?"}${t.bpm ? `（约 ${Math.round(t.bpm)} BPM）` : ""}`;
+  if (field === "genre") return `${t.genre.primary}${t.genre.sub?.length ? " / " + t.genre.sub.join("、") : ""} · ${t.genre.era || ""} ${t.genre.region || ""}`;
+  if (field === "mood") return `${t.mood.join("、")}（正负 ${t.valence} · 激烈 ${t.arousal}）`;
+  if (field === "lyricTheme") return t.lyricTheme.length ? t.lyricTheme.join("、") : "（无歌词 / 未识别）";
+  if (field === "scene") return t.scene.join(" / ");
+  return t.description;
+}
+async function renderTags() {
+  const data = await api("/api/eval/tag-sample");
+  const reviews = new Map(data.reviews.map((r) => [`${r.track_id}|${r.field}`, r]));
+  const total = data.songs.length * data.fields.length;
+  const updateProgress = () => { document.getElementById("progress").textContent = `已标 ${[...reviews.entries()].filter(([key, r]) => r.verdict && data.songs.some((s) => key.startsWith(`${s.id}|`))).length}/${total} 项`; };
+  updateProgress();
+  const main = document.getElementById("main");
+  main.innerHTML = `<p class="hint">这 ${data.songs.length} 首是你播放最多、已打标签的歌（按语言分散抽取）。每一项选：<b>✓ 对</b> · <b>✗ 不对</b> · <b>⚠ 胡编</b>（明显不是这首歌的内容）。描述一项请看"能不能让人认出是这首歌"。</p>` +
+    data.songs.map((s) => `<div class="card" data-track="${s.id}">
+      <div class="q-head"><button class="play" data-play="${s.id}" data-title="${esc(s.title)}" data-artist="${esc(s.artist)}">▶</button><h2>${esc(s.title)}</h2>${favButton(s.id)}<span class="artist">${esc(s.artist)} · 播放 ${s.plays} 次</span></div>
+      ${data.fields.map((field) => { const r = reviews.get(`${s.id}|${field}`); return `<div class="field" data-field="${field}"><b>${fieldLabel[field]}</b><div>${esc(fieldValue(field, s.tags))}<input class="note" placeholder="备注（可选）" value="${esc(r?.note || "")}" style="display:block;margin-top:4px;width:100%"></div>
+        <div class="verdicts">${[["ok", "✓"], ["wrong", "✗"], ["made_up", "⚠"]].map(([v, label]) => `<button data-v="${v}" class="${r?.verdict === v ? "on" : ""}">${label}</button>`).join("")}</div></div>`; }).join("")}
+    </div>`).join("");
+  main.querySelectorAll(".card[data-track]").forEach((card) => card.querySelectorAll(".field").forEach((row) => {
+    const note = row.querySelector("input.note");
+    const key = `${card.dataset.track}|${row.dataset.field}`;
+    const save = async (verdict) => {
+      await api("/api/eval/tag-review", { trackId: Number(card.dataset.track), field: row.dataset.field, verdict });
+      row.querySelectorAll("[data-v]").forEach((other) => other.classList.toggle("on", other.dataset.v === verdict));
+      reviews.set(key, { ...(reviews.get(key) || {}), verdict }); updateProgress();
+    };
+    row.querySelectorAll("[data-v]").forEach((button) => button.onclick = () => save(button.dataset.v));
+    noteSaver(note, "/api/eval/tag-review", { trackId: Number(card.dataset.track), field: row.dataset.field }, markSaved(note));
+  }));
+}
+function render() { loadFavorites().then(() => (tab === "rec" ? renderRec() : renderTags())).catch((error) => { document.getElementById("main").innerHTML = `<p class="err">${esc(error.message)}</p>`; }); }
+render();
+</script>
+</body>
+</html>

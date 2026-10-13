@@ -2,202 +2,23 @@ import { createReadStream } from "node:fs";
 import { opendir, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { dirname, extname, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
+import { extname, join, relative, resolve, sep } from "node:path";
 import { parseFile } from "music-metadata";
-import { classifyProfileEvidence, maximalTitleMatches, nearestTitleAfterArtist, normalizeMatch, sanitizeHardStyles } from "./recommendation-core.mjs";
+import { dashscopeApiKey, deepseekApiKey, deepseekModel, isPlaceholderKey, libraryRoot, port, supportedExtensions } from "./config.mjs";
+import { db, safeJson } from "./db.mjs";
+import { deepseekJson } from "./llm.mjs";
+import { familiarityForRow, getUserProfile, personalSignals, rankingConfig } from "./personalization.mjs";
+import { applyMixQuota, mixTargets, perBatchPick, resolveMix, scoreCandidates, splitBatches, stratifiedRecall } from "./ranking.mjs";
+import { splitArtists } from "./song-matching.mjs";
+import { blendWithReferences, EMBEDDING_VARIANTS, embedQuery, loadVectorStore, recallSize, searchTopN } from "./retrieval.mjs";
+import { applyHardFilters, loadSongTags, sanitizeHardFilters, TAG_VOCAB, tagSummaries } from "./song-tags.mjs";
+import { handleEvalRoute } from "./eval-routes.mjs";
+import { buildHistory } from "./history.mjs";
+import { liveCopyIndex, looseKey, remapUnavailableTracks } from "./remap.mjs";
+import { fixIdentity } from "./metadata-fixes.mjs";
+import { handleCommentRoute } from "./comments.mjs";
+import { isTitleMention, logicalTrackKey, maximalTitleMatches, nearestTitleAfterArtist, normalizeMatch, sanitizeHardStyles } from "./recommendation-core.mjs";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const projectRoot = resolve(here, "..");
-try { process.loadEnvFile(join(projectRoot, ".env.local")); } catch { /* optional local configuration */ }
-const libraryRoot = resolve(process.env.MUSIC_LIBRARY_PATH || join(projectRoot, "..", "music-repo"));
-const databasePath = resolve(process.env.MUSIC_DATABASE_PATH || join(here, "music-library.sqlite"));
-const port = Number(process.env.MUSIC_SERVER_PORT || 3001);
-const deepseekBaseUrl = (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
-const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
-const deepseekApiKey = process.env.DEEPSEEK_API_KEY || "";
-const supportedExtensions = new Set([".mp3", ".flac", ".m4a", ".aac", ".wav", ".ogg"]);
-
-const db = new DatabaseSync(databasePath);
-db.exec("PRAGMA journal_mode = WAL");
-db.exec("PRAGMA foreign_keys = ON");
-db.exec(`CREATE TABLE IF NOT EXISTS tracks (
-  id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
-  artist TEXT NOT NULL, album TEXT, genre TEXT, year INTEGER, duration REAL,
-  bitrate INTEGER, sample_rate INTEGER, file_size INTEGER NOT NULL, folder TEXT NOT NULL,
-  modified_at INTEGER NOT NULL, play_count INTEGER NOT NULL DEFAULT 0,
-  last_played_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-const trackColumns = new Set(db.prepare("PRAGMA table_info(tracks)").all().map((column) => column.name));
-if (!trackColumns.has("available")) db.exec("ALTER TABLE tracks ADD COLUMN available INTEGER NOT NULL DEFAULT 1");
-db.exec(`CREATE TABLE IF NOT EXISTS play_events (
-  id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  event_type TEXT NOT NULL, played_seconds REAL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS feedback (
-  id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  feedback_type TEXT NOT NULL, reason TEXT, session_id TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS memories (
-  id INTEGER PRIMARY KEY, scope TEXT NOT NULL, content TEXT NOT NULL,
-  confidence REAL NOT NULL DEFAULT 0.5, evidence_count INTEGER NOT NULL DEFAULT 1,
-  active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS preference_memories (
-  id INTEGER PRIMARY KEY, memory_key TEXT NOT NULL UNIQUE, label TEXT NOT NULL,
-  weight INTEGER NOT NULL DEFAULT 0, evidence_count INTEGER NOT NULL DEFAULT 1,
-  reason TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'feedback',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS recommendation_events (
-  id INTEGER PRIMARY KEY, request_text TEXT NOT NULL, intent_json TEXT NOT NULL,
-  playlist_json TEXT NOT NULL, model TEXT NOT NULL, total_tokens INTEGER,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS request_logs (
-  id INTEGER PRIMARY KEY,
-  request_text TEXT NOT NULL,
-  requested_count INTEGER NOT NULL DEFAULT 10,
-  mix_json TEXT NOT NULL DEFAULT '{}',
-  status TEXT NOT NULL DEFAULT 'pending',
-  recommendation_id INTEGER UNIQUE REFERENCES recommendation_events(id) ON DELETE SET NULL,
-  error_text TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  completed_at TEXT
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS preference_statements (
-  id INTEGER PRIMARY KEY, memory_key TEXT NOT NULL UNIQUE, statement TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'general', polarity INTEGER NOT NULL DEFAULT 1,
-  weight INTEGER NOT NULL DEFAULT 1, confidence REAL NOT NULL DEFAULT 0.7,
-  evidence_json TEXT NOT NULL DEFAULT '[]', reason TEXT NOT NULL,
-  source TEXT NOT NULL DEFAULT 'feedback', active INTEGER NOT NULL DEFAULT 1,
-  evidence_count INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-const preferenceStatementColumns = new Set(db.prepare("PRAGMA table_info(preference_statements)").all().map((column) => column.name));
-if (!preferenceStatementColumns.has("category")) db.exec("ALTER TABLE preference_statements ADD COLUMN category TEXT NOT NULL DEFAULT 'taste'");
-if (!preferenceStatementColumns.has("status")) db.exec("ALTER TABLE preference_statements ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'");
-db.exec(`UPDATE preference_statements SET category=CASE
-  WHEN memory_key LIKE 'artist:%' THEN 'anchor'
-  WHEN polarity < 0 THEN 'boundary'
-  WHEN scope != 'general' THEN 'context'
-  WHEN statement LIKE '%《%' THEN 'reference'
-  ELSE category END`);
-db.exec(`CREATE TABLE IF NOT EXISTS feedback_entries (
-  id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  verdict TEXT NOT NULL, explanation TEXT NOT NULL, scope TEXT NOT NULL,
-  parsed_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS recommendation_items (
-  id INTEGER PRIMARY KEY, recommendation_id INTEGER NOT NULL REFERENCES recommendation_events(id) ON DELETE CASCADE,
-  track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  position INTEGER NOT NULL, source_kind TEXT NOT NULL, reason TEXT NOT NULL,
-  evidence_json TEXT NOT NULL DEFAULT '[]'
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS user_playlists (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'custom',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS user_playlist_items (
-  id INTEGER PRIMARY KEY, playlist_id INTEGER NOT NULL REFERENCES user_playlists(id) ON DELETE CASCADE,
-  track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(playlist_id, track_id)
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS similarity_calibration_tracks (
-  track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
-  status TEXT NOT NULL DEFAULT 'draft',
-  added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS similarity_annotations (
-  id INTEGER PRIMARY KEY,
-  track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  dimension_key TEXT NOT NULL,
-  observation TEXT NOT NULL DEFAULT '',
-  boundary TEXT NOT NULL DEFAULT '',
-  evidence TEXT NOT NULL DEFAULT '',
-  source TEXT NOT NULL DEFAULT 'manual',
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(track_id, dimension_key)
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS song_experience_profiles (
-  track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
-  style_json TEXT NOT NULL DEFAULT '[]',
-  felt_json TEXT NOT NULL DEFAULT '[]',
-  energy_json TEXT NOT NULL DEFAULT '[]',
-  sound_json TEXT NOT NULL DEFAULT '[]',
-  identity_text TEXT NOT NULL DEFAULT '',
-  avoid_text TEXT NOT NULL DEFAULT '',
-  source TEXT NOT NULL DEFAULT 'codex_curated',
-  review_status TEXT NOT NULL DEFAULT 'needs_user_review',
-  notes TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS similarity_comparisons (
-  id INTEGER PRIMARY KEY,
-  left_track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  right_track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  dimensions_json TEXT NOT NULL DEFAULT '[]',
-  similarity_text TEXT NOT NULL,
-  difference_text TEXT NOT NULL,
-  evidence TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
-const similarityComparisonColumns = new Set(db.prepare("PRAGMA table_info(similarity_comparisons)").all().map((column) => column.name));
-if (!similarityComparisonColumns.has("source")) db.exec("ALTER TABLE similarity_comparisons ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'");
-if (!similarityComparisonColumns.has("review_status")) db.exec("ALTER TABLE similarity_comparisons ADD COLUMN review_status TEXT NOT NULL DEFAULT 'draft'");
-db.prepare("INSERT OR IGNORE INTO user_playlists (id, name, kind) VALUES (1, '我喜欢的音乐', 'favorites')").run();
-const recommendationColumns = new Set(db.prepare("PRAGMA table_info(recommendation_events)").all().map((column) => column.name));
-if (!recommendationColumns.has("plan_json")) db.exec("ALTER TABLE recommendation_events ADD COLUMN plan_json TEXT");
-if (!recommendationColumns.has("seed_json")) db.exec("ALTER TABLE recommendation_events ADD COLUMN seed_json TEXT");
-if (!recommendationColumns.has("title")) db.exec("ALTER TABLE recommendation_events ADD COLUMN title TEXT");
-if (!recommendationColumns.has("summary")) db.exec("ALTER TABLE recommendation_events ADD COLUMN summary TEXT");
-db.exec(`UPDATE recommendation_events SET
-  title=COALESCE(NULLIF(title, ''), '历史歌单'),
-  summary=COALESCE(NULLIF(summary, ''), json_extract(intent_json, '$.summary'), request_text)`);
-db.exec(`INSERT OR IGNORE INTO request_logs
-  (request_text, requested_count, mix_json, status, recommendation_id, created_at, completed_at)
-  SELECT request_text, json_array_length(playlist_json), '{}', 'succeeded', id, created_at, created_at
-  FROM recommendation_events`);
-db.prepare(`INSERT OR IGNORE INTO preference_statements
-  (memory_key, statement, scope, polarity, weight, confidence, evidence_json, reason, source, evidence_count, created_at, updated_at)
-  SELECT memory_key,
-    CASE WHEN source='explicit' AND memory_key LIKE 'artist:%' THEN '喜欢歌手 ' || label
-         WHEN weight < 0 THEN '倾向避开 ' || label ELSE '偏好 ' || label END,
-    'general', CASE WHEN weight < 0 THEN -1 ELSE 1 END, ABS(weight),
-    CASE WHEN source='explicit' THEN 1.0 ELSE 0.65 END, '[]', reason, source,
-    evidence_count, created_at, updated_at FROM preference_memories`).run();
-db.exec("CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_tracks_folder ON tracks(folder)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_tracks_last_played ON tracks(last_played_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_play_events_track_created ON play_events(track_id, created_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_feedback_track_created ON feedback(track_id, created_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_recommendation_events_created ON recommendation_events(created_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_preference_statements_active_weight ON preference_statements(active, weight)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_feedback_entries_created ON feedback_entries(created_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_recommendation_items_recommendation ON recommendation_items(recommendation_id, position)");
-for (const event of db.prepare("SELECT id, playlist_json FROM recommendation_events").all()) {
-  const validIds = new Set(safeJson(event.playlist_json, []).map((id) => Number(String(id).replace("local-", ""))).filter(Number.isFinite));
-  for (const item of db.prepare("SELECT id, track_id FROM recommendation_items WHERE recommendation_id=?").all(event.id)) {
-    if (!validIds.has(Number(item.track_id))) db.prepare("DELETE FROM recommendation_items WHERE id=?").run(item.id);
-  }
-}
-db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendation_items_position_unique ON recommendation_items(recommendation_id, position)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_user_playlist_items_playlist ON user_playlist_items(playlist_id, added_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_user_playlist_items_track ON user_playlist_items(track_id)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_similarity_annotations_track ON similarity_annotations(track_id)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_similarity_comparisons_tracks ON similarity_comparisons(left_track_id, right_track_id)");
-db.exec("PRAGMA optimize");
 
 const upsertTrack = db.prepare(`INSERT INTO tracks (
   relative_path, title, artist, album, genre, year, duration, bitrate,
@@ -253,9 +74,10 @@ async function scanLibrary() {
         const fallback = fallbackIdentity(path.split(sep).at(-1));
         const common = metadata.common;
         const format = metadata.format;
+        const identity = fixIdentity(relativePath, common.title?.trim() || fallback.title, common.artist?.trim() || fallback.artist);
         upsertTrack.run(
-          relativePath, common.title?.trim() || fallback.title,
-          common.artist?.trim() || fallback.artist, common.album?.trim() || null,
+          relativePath, identity.title,
+          identity.artist, common.album?.trim() || null,
           common.genre?.join(" / ") || null, common.year || null,
           format.duration || null, format.bitrate ? Math.round(format.bitrate) : null,
           format.sampleRate || null, fileStat.size, relativePath.split(sep)[0] || "未分类",
@@ -278,17 +100,35 @@ async function scanLibrary() {
       throw error;
     }
     db.exec("PRAGMA optimize");
+    const remapped = remapUnavailableTracks();
+    if (remapped.mapped) console.log("Re-pointed references to removed files:", JSON.stringify(remapped));
     scanState = { ...scanState, running: false, finishedAt: new Date().toISOString() };
     return scanState;
   })().finally(() => { scanPromise = null; });
   return scanPromise;
 }
 
-function serializeTrack(row) {
+function moodFields(trackId) {
+  const summary = tagSummaries().get(Number(trackId));
+  return summary ? { valence: summary.valence, arousal: summary.arousal, chips: summary.chips, language: summary.language, instrumental: summary.instrumental }
+    : { valence: null, arousal: null, chips: [], language: null, instrumental: false };
+}
+
+// A row whose file is gone is shown as the same song from the current library when there is one;
+// otherwise it is marked missing (no audio) instead of failing when clicked.
+let liveCopies = null; let liveCopiesAt = 0;
+function liveCopyOf(row) {
+  if (!liveCopies || Date.now() - liveCopiesAt > 5000) { liveCopies = liveCopyIndex(); liveCopiesAt = Date.now(); }
+  const id = liveCopies.get(looseKey(row));
+  return id ? db.prepare("SELECT * FROM tracks WHERE id=?").get(id) : null;
+}
+
+function serializeTrack(input) {
+  const row = input.available === 0 ? liveCopyOf(input) || input : input;
+  const missing = row.available === 0;
   const bitrateKbps = row.bitrate ? Math.round(row.bitrate / 1000) : null;
   const tags = [row.genre, row.folder, bitrateKbps ? `${bitrateKbps}kbps` : null].filter(Boolean);
-  const forgotten = row.last_played_at && Date.now() - new Date(row.last_played_at).getTime() > 1000 * 60 * 60 * 24 * 90;
-  const kind = !row.play_count ? "library" : forgotten ? "forgotten" : "familiar";
+  const kind = familiarityForRow(row);
   return {
     id: `local-${row.id}`, title: row.title, artist: row.artist,
     album: row.album, genre: row.genre || row.folder,
@@ -296,7 +136,8 @@ function serializeTrack(row) {
     tags, instruments: [], color: ["green", "orange", "violet", "blue", "gold", "cyan"][row.id % 6],
     duration: row.duration, bitrate: bitrateKbps, folder: row.folder,
     playCount: row.play_count, lastPlayedAt: row.last_played_at,
-    audioUrl: `http://localhost:${port}/api/tracks/${row.id}/audio`,
+    audioUrl: missing ? undefined : `http://localhost:${port}/api/tracks/${row.id}/audio`, missing,
+    ...moodFields(row.id),
   };
 }
 
@@ -336,14 +177,6 @@ function requestLogRows(limit = 20) {
       title: row.title, summary: row.summary,
       intent: safeJson(row.intent_json, null),
     }));
-}
-
-function safeJson(value, fallback) {
-  try { return value ? JSON.parse(value) : fallback; } catch { return fallback; }
-}
-
-function logicalTrackKey(row) {
-  return `${String(row.artist || "").trim().toLowerCase()}\u0000${String(row.title || "").trim().toLowerCase()}`;
 }
 
 function dedupeTrackRows(rows) {
@@ -402,50 +235,6 @@ function userPlaylistRows() {
   });
 }
 
-function calibrationRows() {
-  const rows = db.prepare(`WITH ranked AS (
-      SELECT t.*, p.review_status AS calibration_status, p.updated_at AS calibration_added_at,
-        ROW_NUMBER() OVER (
-          PARTITION BY lower(trim(t.title)), lower(trim(t.artist))
-          ORDER BY t.play_count DESC, COALESCE(t.bitrate, 0) DESC, t.id
-        ) AS song_rank
-      FROM song_experience_profiles p JOIN tracks t ON t.id=p.track_id
-      WHERE t.available=1
-    ) SELECT * FROM ranked WHERE song_rank=1
-    ORDER BY calibration_added_at DESC, artist, title`).all();
-  const profileQuery = db.prepare(`SELECT style_json, felt_json, energy_json, sound_json,
-    identity_text, avoid_text, source, review_status, notes, updated_at
-    FROM song_experience_profiles WHERE track_id=?`);
-  return rows.map((row) => ({
-    track: serializeTrack(row), status: row.calibration_status, addedAt: row.calibration_added_at,
-    annotations: {},
-    profile: (() => {
-      const profile = profileQuery.get(row.id);
-      return profile ? {
-        style: safeJson(profile.style_json, []), feltExperience: safeJson(profile.felt_json, []),
-        energyArc: safeJson(profile.energy_json, []), sound: safeJson(profile.sound_json, []),
-        identity: profile.identity_text, avoid: profile.avoid_text, source: profile.source,
-        reviewStatus: profile.review_status, notes: profile.notes, updatedAt: profile.updated_at,
-      } : null;
-    })(),
-  }));
-}
-
-function comparisonRows() {
-  return db.prepare(`SELECT c.*, lt.title AS left_title, lt.artist AS left_artist,
-    rt.title AS right_title, rt.artist AS right_artist
-    FROM similarity_comparisons c
-    JOIN tracks lt ON lt.id=c.left_track_id JOIN tracks rt ON rt.id=c.right_track_id
-    ORDER BY c.id DESC LIMIT 100`).all().map((row) => ({
-      id: row.id,
-      leftTrack: { id: `local-${row.left_track_id}`, title: row.left_title, artist: row.left_artist },
-      rightTrack: { id: `local-${row.right_track_id}`, title: row.right_title, artist: row.right_artist },
-      dimensions: safeJson(row.dimensions_json, []), similarity: row.similarity_text,
-      difference: row.difference_text, evidence: row.evidence, source: row.source,
-      reviewStatus: row.review_status, createdAt: row.created_at,
-    }));
-}
-
 function upsertStatement({ statement, scope = "general", polarity = 1, weight = 1, confidence = 0.75, evidence = [], reason, source = "feedback", category, status = "confirmed" }) {
   const normalized = statement.trim().toLowerCase().replace(/\s+/g, " ");
   const memoryKey = `statement:${createHash("sha1").update(`${scope}:${normalized}`).digest("hex")}`;
@@ -497,141 +286,74 @@ function recordPromptSignals({ prompt, plan, seeds, recommendationId }) {
   });
 }
 
-function shuffled(values) {
-  const copy = [...values];
-  for (let index = copy.length - 1; index > 0; index -= 1) {
-    const target = Math.floor(Math.random() * (index + 1));
-    [copy[index], copy[target]] = [copy[target], copy[index]];
-  }
-  return copy;
-}
-
-function parseModelJson(content) {
-  if (!content) throw new Error("模型没有返回正文，请重试");
-  const cleaned = content.trim().replace(/^```json\s*/i, "").replace(/\s*```$/, "");
-  return JSON.parse(cleaned);
-}
-
-async function deepseekJson(system, value, maxTokens = 1400) {
-  if (!deepseekApiKey || /在这里|填入|your/i.test(deepseekApiKey)) throw new Error("DeepSeek API Key 尚未配置");
-  let lastError;
-  let totalTokens = 0;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const retryRule = attempt ? "\n上一次结构化输出无法解析。这次必须返回一个完整、简洁、无 Markdown 的 JSON 对象；缩短文字，不得在字符串中换行。" : "";
-    let apiResponse;
-    try {
-      apiResponse = await fetch(`${deepseekBaseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${deepseekApiKey}` },
-        body: JSON.stringify({ model: deepseekModel, messages: [{ role: "system", content: `${system}${retryRule}` }, { role: "user", content: JSON.stringify(value) }], thinking: { type: "disabled" }, response_format: { type: "json_object" }, temperature: attempt ? 0.1 : 0.35, max_tokens: attempt ? Math.ceil(maxTokens * 1.5) : maxTokens }),
-        signal: AbortSignal.timeout(45_000),
-      });
-    } catch (error) {
-      lastError = error;
-      if (attempt === 0) continue;
-      throw new Error(`DeepSeek 请求超时或网络异常：${error?.message || "未知错误"}`);
-    }
-    const result = await apiResponse.json().catch(() => ({}));
-    if (!apiResponse.ok) throw new Error(result.error?.message || `DeepSeek 请求失败 (${apiResponse.status})`);
-    totalTokens += Number(result.usage?.total_tokens || 0);
-    try {
-      return { value: parseModelJson(result.choices?.[0]?.message?.content), usage: { ...(result.usage || {}), total_tokens: totalTokens }, model: result.model || deepseekModel };
-    } catch (error) { lastError = error; }
-  }
-  throw new Error(`DeepSeek 连续返回了无法解析的 JSON：${lastError?.message || "未知错误"}`);
-}
-
 function includesArtist(row, names) {
   const artist = row.artist.toLowerCase();
   return names.some((name) => artist.includes(String(name).toLowerCase()));
 }
 
-function candidateRows(plan, seeds, count) {
-  const songKey = logicalTrackKey;
+// Artist constraints and one row per logical song. Tag-based hard filters run on the result in
+// vectorCandidates (song-tags.mjs), where the v2 audio tags are available.
+function hardFilteredRows(plan) {
   const rawRows = db.prepare("SELECT * FROM tracks WHERE available=1 ORDER BY play_count DESC, COALESCE(bitrate,0) DESC, id").all();
   const canonicalRows = new Map();
-  for (const row of rawRows) if (!canonicalRows.has(songKey(row))) canonicalRows.set(songKey(row), row);
+  for (const row of rawRows) if (!canonicalRows.has(logicalTrackKey(row))) canonicalRows.set(logicalTrackKey(row), row);
   const allRows = [...canonicalRows.values()];
-  const uniqueSeeds = [...new Map(seeds.map((row) => [songKey(row), row])).values()];
   const hardArtists = Array.isArray(plan.hardArtists) ? plan.hardArtists.filter(Boolean) : [];
   const excludedArtists = Array.isArray(plan.excludedArtists) ? plan.excludedArtists.filter(Boolean) : [];
   const allowedRows = excludedArtists.length ? allRows.filter((row) => !includesArtist(row, excludedArtists)) : allRows;
-  let base = hardArtists.length ? allowedRows.filter((row) => includesArtist(row, hardArtists)) : allowedRows;
-  const profileRows = db.prepare(`SELECT track_id, style_json, felt_json, energy_json, sound_json, identity_text, avoid_text, source, review_status
-    FROM song_experience_profiles`).all();
-  const profileByTrack = new Map(profileRows.map((profile) => [profile.track_id, {
-    style: safeJson(profile.style_json, []), feltExperience: safeJson(profile.felt_json, []),
-    energyArc: safeJson(profile.energy_json, []), sound: safeJson(profile.sound_json, []),
-    identity: profile.identity_text, avoid: profile.avoid_text, source: profile.source, reviewStatus: profile.review_status,
-  }]));
-  const seedProfiles = uniqueSeeds.map((row) => profileByTrack.get(row.id)).filter(Boolean);
-  const hardStyles = Array.isArray(plan.hardStyles) ? plan.hardStyles.filter(Boolean) : [];
-  const mustAvoid = Array.isArray(plan.mustAvoid) ? plan.mustAvoid.filter(Boolean) : [];
-  const positiveText = (profile) => profile ? [...profile.style, ...profile.feltExperience, ...profile.energyArc, ...profile.sound, profile.identity].join(" ") : "";
-  if (hardStyles.length) base = base.filter((row) => {
-    const profile = profileByTrack.get(row.id);
-    return profile && hardStyles.every((required) => profile.style.some((actual) => {
-      const left = normalizeMatch(required); const right = normalizeMatch(actual);
-      return left && (left === right || right.includes(left));
-    }));
-  });
-  if (mustAvoid.length) base = base.filter((row) => {
-    const text = normalizeMatch(positiveText(profileByTrack.get(row.id)));
-    return !mustAvoid.some((term) => normalizeMatch(term).length >= 2 && text.includes(normalizeMatch(term)));
-  });
-  const classified = base.map((row) => ({ row,
-    ...(classifyProfileEvidence({ profile: profileByTrack.get(row.id), seedProfiles, plan }) || {
-      tier: "explore", exactCount: 0, relatedCount: 0,
-      evidence: ["没有足够的直接档案证据，仅作为探索候选"],
-    }),
-  })).sort((left, right) => {
-    const order = { direct: 2, related: 1, explore: 0 };
-    return order[right.tier] - order[left.tier]
-      || right.exactCount - left.exactCount
-      || right.relatedCount - left.relatedCount
-      || right.row.play_count - left.row.play_count
-      || (right.row.bitrate || 0) - (left.row.bitrate || 0)
-      || left.row.id - right.row.id;
-  });
-  const selected = [];
-  const selectedKeys = new Set();
-  const artistCounts = new Map();
-  const add = (entry, artistCap = Infinity) => {
-    const key = songKey(entry.row); const artistKey = normalizeMatch(entry.row.artist);
-    if (selectedKeys.has(key) || (artistCounts.get(artistKey) || 0) >= artistCap) return false;
-    selected.push(entry); selectedKeys.add(key); artistCounts.set(artistKey, (artistCounts.get(artistKey) || 0) + 1); return true;
-  };
-  for (const row of uniqueSeeds) add({ row, tier: "reference", exactCount: 0, relatedCount: 0, evidence: ["用户指定的参考歌曲"] });
-  const artistCap = hardArtists.length ? Infinity : 4;
-  for (const entry of classified) {
-    if (selected.length >= 80) break;
-    add(entry, artistCap);
-  }
-  return selected.slice(0, 80);
+  return { base: hardArtists.length ? allowedRows.filter((row) => includesArtist(row, hardArtists)) : allowedRows, hardArtists };
 }
 
-function experienceProfileForTrack(row) {
-  const experience = db.prepare(`SELECT style_json, felt_json, energy_json, sound_json,
-    identity_text, avoid_text, source, review_status FROM song_experience_profiles WHERE track_id=?`).get(row.id);
-  return experience ? {
-    style: safeJson(experience.style_json, []),
-    feltExperience: safeJson(experience.felt_json, []),
-    energyArc: safeJson(experience.energy_json, []),
-    sound: safeJson(experience.sound_json, []),
-    identity: experience.identity_text,
-    avoid: experience.avoid_text,
-    source: experience.source,
-    reviewStatus: experience.review_status,
-  } : null;
+// Coarse recall (relevance only, no personalisation) followed by the programmatic part of fine ranking.
+async function vectorCandidates({ prompt, plan, includedSeeds, excludedSeedIds, count, store, tagsById, targets }) {
+  const { base: artistFiltered, hardArtists } = hardFilteredRows(plan);
+  // Only audio-tagged songs (those with a vector) can be judged; hard filters run on their v2 tags.
+  const tagged = artistFiltered.filter((row) => store.byId.has(row.id));
+  const { rows: base, relaxed } = applyHardFilters(tagged, tagsById, plan.hardFilters, recallSize(count, rankingConfig.recall));
+  const avoidTerms = (plan.mustAvoid || []).map(normalizeMatch).filter((term) => term.length >= 2);
+  const avoidText = (row) => { const tags = tagsById.get(Number(row.id)); return tags ? normalizeMatch([tags.genre.primary, ...tags.genre.sub, ...tags.mood, ...tags.instruments].join(" ")) : ""; };
+  const seedKeys = new Set(includedSeeds.map(logicalTrackKey));
+  const eligible = base.filter((row) => !excludedSeedIds.has(Number(row.id)) && !seedKeys.has(logicalTrackKey(row))
+    && !avoidTerms.some((term) => avoidText(row).includes(term)));
+  const referenceVectors = includedSeeds.map((row) => store.byId.get(row.id)).filter(Boolean);
+  const queryVector = blendWithReferences(await embedQuery(prompt), referenceVectors, rankingConfig.recall.referenceBlend);
+  const limit = recallSize(count, rankingConfig.recall);
+  const artistCap = hardArtists.length ? Infinity : 4;
+  const artistCounts = new Map();
+  const profile = getUserProfile(store);
+  const ranked = searchTopN(queryVector, eligible, store, eligible.length)
+    .map((item) => ({ ...item, id: Number(item.row.id), bucket: familiarityForRow(item.row, profile) }));
+  const recalled = stratifiedRecall(ranked, (item) => item.bucket, targets, limit, {
+    accept: (item) => {
+      const artists = splitArtists(item.row.artist);
+      if (artists.some((artist) => (artistCounts.get(artist) || 0) >= artistCap)) return false;
+      for (const artist of artists) artistCounts.set(artist, (artistCounts.get(artist) || 0) + 1);
+      return true;
+    },
+  });
+  const scored = scoreCandidates(recalled.map((item) => ({
+    id: Number(item.row.id), row: item.row, querySim: item.querySim,
+    personal: personalSignals(item.row, item.vector, profile), bucket: item.bucket,
+  })), rankingConfig);
+  return { scored, profile, eligibleCount: eligible.length, taggedCount: tagged.length, relaxed, referenceCount: referenceVectors.length };
 }
+
+const round3 = (value) => (Number.isFinite(value) ? Math.round(value * 1000) / 1000 : null);
 
 function referencePolicy(plan, seeds) {
   const instructions = Array.isArray(plan.referenceTracks) ? plan.referenceTracks : [];
-  const policyById = new Map(instructions.map((item) => [Number(item?.id), item?.policy === "exclude" ? "exclude" : "include"]));
+  // "ignore": the title only appears as ordinary words ("深夜一个人开车" is not a request for the song 一个人).
+  const policyById = new Map(instructions.map((item) => [Number(item?.id), ["exclude", "ignore"].includes(item?.policy) ? item.policy : "include"]));
   return seeds.map((row) => ({ row, policy: policyById.get(Number(row.id)) || "include" }));
 }
 
-async function generateRecommendation(prompt, mix, count, seedIds = []) {
+// mix: explicit slider ratios, or null to let the planner choose them from the situation.
+async function generateRecommendation(prompt, mix, count, seedIds = [], options = {}) {
+  const variant = EMBEDDING_VARIANTS.includes(options.embeddingVariant) ? options.embeddingVariant : rankingConfig.recall.embeddingVariant || "rich";
+  const store = loadVectorStore(variant);
+  if (!store.byId.size) throw new Error("曲库还没有歌曲向量：请先运行 scripts/tag-audio-omni.mjs 打标，再运行 scripts/build-embeddings.mjs");
+  if (isPlaceholderKey(dashscopeApiKey)) throw new Error("DASHSCOPE_API_KEY 尚未配置，无法把需求转成向量");
+  const tagsById = loadSongTags();
   const memories = memoryRows().filter((row) => row.status === "confirmed").slice(0, 24).map((row) => ({ statement: row.statement, scope: row.scope, weight: row.weight, confidence: row.confidence }));
   const favoriteTracks = db.prepare(`SELECT t.id, t.title, t.artist, t.album FROM user_playlist_items i
     JOIN tracks t ON t.id=i.track_id JOIN user_playlists p ON p.id=i.playlist_id
@@ -644,10 +366,7 @@ async function generateRecommendation(prompt, mix, count, seedIds = []) {
   const availableTracks = db.prepare("SELECT * FROM tracks WHERE available=1").all();
   const normalizedPrompt = normalizeMatch(prompt);
   const mentionedArtists = artistCatalog.filter((row) => row.artist.length > 1 && normalizedPrompt.includes(normalizeMatch(row.artist)));
-  const exactMentionedTracks = maximalTitleMatches(availableTracks.filter((row) => {
-    const title = normalizeMatch(row.title);
-    return title.length >= 2 && normalizedPrompt.includes(title);
-  })).sort((left, right) => normalizeMatch(right.title).length - normalizeMatch(left.title).length);
+  const exactMentionedTracks = maximalTitleMatches(availableTracks.filter((row) => isTitleMention(prompt, row.title))).sort((left, right) => normalizeMatch(right.title).length - normalizeMatch(left.title).length);
   let mentionedTracks = exactMentionedTracks.slice(0, 5);
   if (!mentionedTracks.length && mentionedArtists.length) {
     mentionedTracks = mentionedArtists.map((item) => nearestTitleAfterArtist(
@@ -656,89 +375,134 @@ async function generateRecommendation(prompt, mix, count, seedIds = []) {
   }
   const seeds = dedupeTrackRows([...explicitSeeds, ...mentionedTracks]).slice(0, 5);
   const planningArtists = [...new Map([...mentionedArtists, ...artistCatalog.slice(0, 240)].map((row) => [row.artist, row])).values()];
-  const planningSystem = `你是 Moment 的检索规划器。不要直接选歌，先把用户的一整段自然语言需求转换成数据库检索计划。参考歌曲、心情、场景、数量和排除条件都来自同一个 request；referencedTracksFoundInLibrary 是系统从这段话中识别出的本地歌曲，其 experienceProfile 是本地听感档案，source 和 reviewStatus 表明来源与复检状态；用户校准和已审核档案优先，llm_bulk_draft 可用但需保留不确定性。歌曲内容特征可能不完整，因此必须区分硬条件和软偏好。
-只返回JSON：{"intentSummary":"","hardArtists":[""],"hardStyles":[""],"excludedArtists":[""],"candidateArtists":[""],"mustKeep":[""],"mustAvoid":[""],"softPreferences":[""],"seedRelations":[""],"requiredEvidence":[""],"mixExplanation":"","referenceTracks":[{"id":1,"policy":"include","reason":""}]}。
-referenceTracks必须覆盖所有识别出的参考歌，不得填写 referencedTracksFoundInLibrary 之外的ID。用户说“和X类似”时policy默认为include，参考歌占用歌单一个名额；只有用户明确说“不要X”“排除X”“以X为参考但不要X”或“除了X再找”时，对应歌曲才设为exclude。参考歌档案里的style只是相似性目标，绝对不能自动复制到hardStyles。hardArtists只有用户明确限定歌手时才填写，“和某歌手的X类似”不等于限定该歌手；hardStyles只能收录用户原文明确说出的必须曲风；candidateArtists只能从提供的歌手目录选择；不要把本次偏好写成长期偏好。`;
+  const planningSystem = `你是 Moment 的检索规划器。不要直接选歌，先把用户的一整段自然语言需求转换成数据库检索计划。参考歌曲、心情、场景、数量和排除条件都来自同一个 request；referencedTracksFoundInLibrary 是系统从这段话中识别出的本地歌曲，tags 是模型听整首歌得到的标签。
+曲库每首歌有这些可过滤的标签：语言 ${TAG_VOCAB.languages.join("/")}；人声 ${TAG_VOCAB.vocalPresence.join("/")}；演唱者 ${TAG_VOCAB.vocalTypes.join("/")}；体感节奏 ${TAG_VOCAB.tempo.join("/")}；原声/电子 ${TAG_VOCAB.acousticElectronic.join("/")}；曲风文本（中英混写，如"古典（Classical）""节奏布鲁斯（R&B）""管弦乐（Orchestral）"）；BPM；valence 情绪正负（0消极-1积极）；arousal 激烈程度（0平静-1激烈）。
+hardFilters 只放用户原话明确要求、不满足就算推荐错误的条件，其余一律放 softPreferences，交给向量检索和精排：
+- languages/vocalPresence/vocalTypes/tempo/acousticElectronic 只能用上面列出的取值。"粤语歌"→languages ["粤语"]；"纯音乐"→vocalPresence ["纯音乐"]；"女声"→vocalTypes ["女声"]。
+- genres：用户点名的曲风，给出该曲风在标签里可能出现的中英文关键词，可以包含它的子类，不能扩展到相邻曲风。"古典"→["古典","Classical","管弦","Orchestral","交响"]；"说唱"→["说唱","Rap","嘻哈","Hip"]。
+- bpmRange/valenceRange/arousalRange 只在用户明确给出强度边界时填写，并留宽余量。"别太吵"→arousalRange [0,0.6]；"跑步用，160左右"→bpmRange [145,175]。"激昂""伤感"这类情绪词不填区间，放 softPreferences。
+mix 是本次歌单的熟悉度比例（familiar=近期常听，forgotten=很久没听的旧爱，discover=曲库里从没听过的歌，三项合计100）：
+- 用户原话说了比例或倾向（"八成要听过的""多推点新歌"）时按原话换算，source="request"。
+- 没说但 desiredMix 不为 null 时照抄 desiredMix，source="slider"。
+- 都没有时按此刻的情境判断，source="situation"：情绪低落、需要安慰时熟悉的歌多一些；兴奋、想探索、做专注背景时新歌可以多一些。reason 用一句话向用户说明为什么这样配。
+只返回JSON：{"intentSummary":"","hardArtists":[""],"excludedArtists":[""],"candidateArtists":[""],"hardFilters":{"languages":[],"vocalPresence":[],"vocalTypes":[],"tempo":[],"acousticElectronic":[],"genres":[],"bpmRange":null,"valenceRange":null,"arousalRange":null},"mustAvoid":[""],"softPreferences":[""],"mix":{"familiar":0,"forgotten":0,"discover":0,"source":"","reason":""},"referenceTracks":[{"id":1,"policy":"include","reason":""}]}。
+referenceTracks必须覆盖所有识别出的参考歌，不得填写 referencedTracksFoundInLibrary 之外的ID。识别是按字面匹配的，可能误判：如果歌名在原话里只是普通词语、用户并没有在提这首歌（如"深夜一个人开车"里的"一个人"、"想听点歌"里的"想听"），policy 填 ignore。用户说"和X类似"时policy默认为include，参考歌占用歌单一个名额；只有用户明确说"不要X""排除X""以X为参考但不要X"或"除了X再找"时，对应歌曲才设为exclude。参考歌的标签只是相似性目标，绝对不能自动复制到hardFilters。hardArtists只有用户明确限定歌手时才填写，"和某歌手的X类似"不等于限定该歌手；candidateArtists只能从提供的歌手目录选择；mustAvoid 只放用户明确排除的曲风、乐器或情绪词；不要把本次偏好写成长期偏好。`;
   const planning = await deepseekJson(planningSystem, {
     request: prompt, desiredMix: mix,
     referencedTracksFoundInLibrary: seeds.map((row) => ({
       id: row.id, title: row.title, artist: row.artist, album: row.album,
-      experienceProfile: experienceProfileForTrack(row),
+      tags: tagsById.get(Number(row.id)) || null,
     })),
     longTermMemories: memories, favoriteTracks, recentSessionFeedback: recentFeedback,
     recentRequests, mentionedArtists, availableArtists: planningArtists,
-  }, 1400);
-  planning.value.hardStyles = sanitizeHardStyles(prompt, planning.value.hardStyles);
+  }, 1600);
+  planning.value.hardFilters = sanitizeHardFilters(planning.value.hardFilters);
+  // A genre filter must be grounded in the user's own words: at least one keyword has to appear in the request.
+  if (!sanitizeHardStyles(prompt, planning.value.hardFilters.genres).length) planning.value.hardFilters.genres = [];
+  mix = resolveMix(planning.value.mix, mix);
+  planning.value.mix = mix;
   const recognizedSeedIds = new Set(seeds.map((row) => Number(row.id)));
   planning.value.referenceTracks = (Array.isArray(planning.value.referenceTracks) ? planning.value.referenceTracks : [])
     .filter((item) => recognizedSeedIds.has(Number(item?.id)));
   const references = referencePolicy(planning.value, seeds);
   const includedSeeds = references.filter((item) => item.policy === "include").map((item) => item.row);
   const excludedSeedIds = new Set(references.filter((item) => item.policy === "exclude").map((item) => Number(item.row.id)));
-  const candidateEntries = candidateRows(planning.value, includedSeeds, count).filter((entry) => !excludedSeedIds.has(Number(entry.row.id)));
+  const pipeline = { retrieval: "vector", embeddingVariant: variant, queryText: prompt, hardFilters: planning.value.hardFilters, mix };
+  const targets = mixTargets(mix, Math.max(0, count - includedSeeds.length));
+  const { scored, profile, eligibleCount, taggedCount, relaxed, referenceCount } = await vectorCandidates({ prompt, plan: planning.value, includedSeeds, excludedSeedIds, count, store, tagsById, targets });
+  pipeline.taggedSongs = taggedCount;
+  pipeline.relaxedFilters = relaxed;
+  const candidateEntries = [
+    ...includedSeeds.map((row) => ({ row, tier: "reference", evidence: ["用户指定的参考歌曲"] })),
+    ...scored.map((item) => ({ row: item.row, tier: "vector", evidence: [], item })),
+  ];
+  pipeline.eligibleAfterHardFilters = eligibleCount;
+  pipeline.referenceVectorsBlended = referenceCount;
+  pipeline.clusters = profile.clusters ? { k: profile.clusters.k, silhouette: round3(profile.clusters.silhouette), songCount: profile.clusters.songCount } : null;
+  pipeline.recalled = scored.map((item) => ({ id: item.id, title: item.row.title, artist: item.row.artist, bucket: item.bucket,
+    querySim: round3(item.querySim), personalScore: round3(item.personalScore), total: round3(item.total) }));
   const candidates = candidateEntries.map((entry) => entry.row);
   if (!candidateEntries.length) throw new Error("没有找到满足硬条件的本地歌曲");
-  const candidatePayload = candidateEntries.map(({ row, tier, evidence }) => {
-    const experienceProfile = experienceProfileForTrack(row);
-    return {
-      id: row.id, title: row.title, artist: row.artist, album: row.album,
-      genre: row.genre, year: row.year, folder: row.folder, playCount: row.play_count,
-      lastPlayedAt: row.last_played_at, sourceKind: serializeTrack(row).kind,
-      experienceProfile, recallTier: tier, recallEvidence: evidence,
-      evidenceAvailable: [row.genre ? "原始流派" : null, row.album ? "专辑" : null,
-        experienceProfile ? (experienceProfile.source === "llm_bulk_draft" ? "模型批量听感草稿（待复检）" : "已策展听感档案") : null,
-        row.play_count ? "本应用播放记录" : "个人曲库/历史未知"].filter(Boolean),
-    };
-  });
-  const rankingSystem = `你是 Moment 的歌单策展模型。只能从候选歌曲中选择，不能编造歌曲事实。用户导入但从未在本应用播放的歌属于“个人曲库/历史未知”，不能称为新歌或遗忘旧爱。候选中若存在 experienceProfile，依据曲风指纹、实际听感、能量走向、声音表现和排除边界，判断它能否承接用户此刻想获得的体验。recallTier 和 recallEvidence 只解释程序为何召回这首歌，不是相似度分数，不能代替你的语义判断。不能因为歌手相同、主题相似或共享“忧伤/内省”等宽泛词语，就判定两首歌适合连续推荐；identity 和 avoid 是防止误推的重要边界。referenceTracksToKeep 中的参考歌必须保留并占用名额。当用户没有限定歌手时，同一歌手最多选2首；当前需求和参考歌高于长期歌手偏好，长期记忆只能在两首歌同样匹配时用于决胜。
-把 hardArtists、hardStyles、用户明确排除项和 intent.mustHave 当作不可违反规则。歌曲只满足“嗨”“悲伤”等情绪、却不满足用户明确指定的曲风时绝对不能入选；歌手偏好也不能覆盖曲风硬条件。优先从 direct 和 related 中选择；explore 只是防止召回遗漏，只有完整档案经语义判断确实匹配时才能选，不能拿它凑数量。证据不足或合格歌曲不够时允许少选。软偏好允许基于常识判断，但理由必须指出依据，证据不足时直说“基于歌曲与歌手的已知风格判断”。
-只返回JSON：{"title":"","summary":"","intent":{"summary":"","mustHave":[""],"avoid":[""],"softPreferences":[""]},"selections":[{"id":1,"reason":"","evidence":[""]}]}。尽量选满请求数量并保持歌手、专辑和听感的多样性。`;
-  const ranking = await deepseekJson(rankingSystem, {
+  const candidatePayload = candidateEntries.map(({ row, tier, item }) => ({
+    id: row.id, title: row.title, artist: row.artist, album: row.album, sourceKind: serializeTrack(row).kind,
+    tags: tagsById.get(Number(row.id)) || null, recallTier: tier,
+    ...(item ? { querySim: round3(item.queryScore), personalScore: round3(item.personalScore) } : {}),
+  }));
+  const tagGuide = `候选的 tags 是模型完整听过这首歌后的标签：language 语言、vocalPresence/vocalType 人声、genre 曲风、instruments/texture 声音、tempo/bpm 节奏、arcShape/arc 能量走向、mood 情绪词、valence 情绪正负(0消极-1积极)、arousal 激烈程度(0平静-1激烈)、lyricTheme 歌词主题、scene 适合的处境、description 综合描述。依据这些判断它能否承接用户此刻想要的体验；标签由模型生成，可能有少量误差，与常识明显冲突时以常识为准并在理由中说明。`;
+  const rankingSystem = `你是 Moment 的歌单策展模型。只能从候选歌曲中选择，不能编造歌曲事实。${tagGuide}不能因为共享"忧伤""深情"这类宽泛情绪词，就判定歌曲适合；要看曲风、声音、能量和歌词主题是否真正对得上此刻的需求。referenceTracksToKeep 中的参考歌必须保留并占用名额。当用户没有限定歌手时，同一歌手最多选2首；当前需求和参考歌高于长期歌手偏好，长期记忆只能在两首歌同样匹配时用于决胜。
+retrievalPlan.hardFilters 已由程序严格执行，候选都满足；用户明确排除的内容（mustAvoid、excludedArtists）绝不能入选。证据不足或合格歌曲不够时允许少选，不能拿不合适的歌凑数。理由要具体到这首歌的声音、情绪或歌词，并说明它为什么适合此刻，不要套话。
+只返回JSON：{"title":"","summary":"","intent":{"summary":"","mustHave":[""],"avoid":[""],"softPreferences":[""]},"selections":[{"id":1,"reason":"","evidence":[""]}]}。尽量选满请求数量并保持歌手和听感的多样性。`;
+  const rankingContext = {
     request: prompt, requestedCount: count, desiredMix: mix,
     retrievalPlan: planning.value, longTermMemories: memories, favoriteTracks,
     recentSessionFeedback: recentFeedback,
     referenceTracksToKeep: includedSeeds.map((row) => ({ id: row.id, title: row.title, artist: row.artist })),
-    candidates: candidatePayload,
+  };
+  let rankingTokens = 0;
+  const payloadById = new Map(candidatePayload.map((item) => [Number(item.id), item]));
+  // Fine ranking: the vector pool is already ordered by total = α·需求 + β·口味. The LLM only
+  // chooses (never scores): 3 round-robin batches → each keeps k → one final choice from the union.
+  const scoreRule = `
+候选已按综合分排序（querySim=本次需求匹配度，personalScore=用户长期口味匹配度，均为0到1）。它们只是程序给的参考排序，不能替代你的语义判断：先判断是否满足本次需求，语义同样合格时优先 personalScore 更高、排序更靠前的歌。sourceKind 表示熟悉度：familiar=近期熟悉，forgotten=遗忘旧爱，library=从未听过。`;
+  const vectorItems = candidateEntries.filter((entry) => entry.item).map((entry) => entry.item);
+  const batches = splitBatches(vectorItems, rankingConfig.llm.batches);
+  const pick = perBatchPick(count, rankingConfig);
+  const mixRule = `用户这次希望最终歌单里 familiar ${targets.familiar} 首、forgotten ${targets.forgotten} 首、library ${targets.library} 首（看候选的 sourceKind）。初筛时在符合需求的前提下，各类别都要按这个比例留够备选，配额多的类别多留；不要因为某一类整体更顺手就把另一类全部淘汰。`;
+  const batchSystem = `${rankingSystem}${scoreRule}
+这是分批初筛：只从本批候选中选出最多 ${pick} 首最符合需求的歌，按合适程度从高到低排列，宁缺毋滥。${mixRule}title、summary、intent 可留空。`;
+  const batchResults = await Promise.all(batches.map((batch) => deepseekJson(batchSystem, {
+    ...rankingContext, requestedCount: pick, candidates: batch.map((item) => payloadById.get(item.id)),
+  }, Math.min(3000, 800 + pick * 120))));
+  const batchReasons = new Map();
+  const batchPicks = batchResults.map((result, index) => {
+    const allowed = new Set(batches[index].map((item) => item.id));
+    const picks = (Array.isArray(result.value?.selections) ? result.value.selections : []).filter((selection) => allowed.has(Number(selection.id))).slice(0, pick);
+    for (const selection of picks) if (!batchReasons.has(Number(selection.id))) batchReasons.set(Number(selection.id), selection);
+    rankingTokens += Number(result.usage?.total_tokens || 0);
+    return picks.map((selection) => Number(selection.id));
+  });
+  const vectorPool = vectorItems.filter((item) => batchReasons.has(item.id));
+  const finalSystem = `${rankingSystem}${scoreRule}
+这是终选：候选已经过分批初筛。用户希望的熟悉度配额为 ${JSON.stringify(targets)}，在满足需求的前提下尽量贴近这个配额。`;
+  const ranking = await deepseekJson(finalSystem, {
+    ...rankingContext, mixTargets: targets,
+    candidates: [...includedSeeds.map((row) => payloadById.get(Number(row.id))), ...vectorPool.map((item) => payloadById.get(item.id))],
   }, Math.min(4200, 1200 + count * 100));
+  rankingTokens += Number(ranking.usage?.total_tokens || 0);
+  const poolById = new Map(vectorPool.map((item) => [item.id, item]));
+  const finalSelections = Array.isArray(ranking.value?.selections) ? ranking.value.selections : [];
+  const ordered = finalSelections.filter((selection) => poolById.has(Number(selection.id)))
+    .map((selection) => ({ id: Number(selection.id), reason: selection.reason, evidence: selection.evidence }));
+  const pool = vectorPool.map((item) => ({ id: item.id, reason: batchReasons.get(item.id)?.reason, evidence: batchReasons.get(item.id)?.evidence }));
+  // Reserve: recalled songs the batches did not keep, best total score first — only used to cover a bucket.
+  const allById = new Map(vectorItems.map((item) => [item.id, item]));
+  const reserve = vectorItems.filter((item) => !poolById.has(item.id)).sort((left, right) => right.total - left.total)
+    .map((item) => ({ id: item.id, reason: "按你要的熟悉度比例补入：在这一类里与需求最接近的一首。", evidence: [`需求匹配 ${round3(item.queryScore)}`] }));
+  const bucketOf = (item) => (poolById.get(item.id) || allById.get(item.id)).bucket;
+  const quota = applyMixQuota(ordered, pool, targets, Math.max(0, count - includedSeeds.length), bucketOf, reserve);
+  const referenceSelections = finalSelections.filter((selection) => includedSeeds.some((seed) => Number(seed.id) === Number(selection.id)));
+  ranking.value.selections = [...referenceSelections, ...quota.chosen];
+  Object.assign(pipeline, { batches: batches.map((batch) => batch.map((item) => item.id)), perBatchPick: pick, batchPicks,
+    finalPicks: ordered.map((item) => item.id), mixTargets: targets, mixFilled: quota.filled, mixShortfall: quota.shortfall });
+  planning.value.pipeline = pipeline;
   const modelResult = ranking.value;
   const candidateMap = new Map(candidates.map((row) => [Number(row.id), row]));
-  const hardStyles = Array.isArray(planning.value.hardStyles) ? planning.value.hardStyles.map((value) => String(value).trim()).filter(Boolean) : [];
-  const normalizedStyle = (value) => String(value).toLowerCase().replace(/[\s·・_\-/]/g, "");
-  const payloadById = new Map(candidatePayload.map((item) => [Number(item.id), item]));
-  const mustAvoid = Array.isArray(planning.value.mustAvoid) ? planning.value.mustAvoid.map((value) => String(value).trim()).filter(Boolean) : [];
   const excludedArtists = Array.isArray(planning.value.excludedArtists) ? planning.value.excludedArtists.map((value) => String(value).trim()).filter(Boolean) : [];
-  const violatesMustAvoid = (row) => {
-    if (excludedArtists.length && includesArtist(row, excludedArtists)) return true;
-    if (!mustAvoid.length) return false;
-    const profile = payloadById.get(Number(row.id))?.experienceProfile;
-    if (!profile) return false;
-    const positiveText = [...profile.style, ...profile.feltExperience, ...profile.energyArc, ...profile.sound, profile.identity].join(" ");
-    const normalized = normalizeMatch(positiveText);
-    return mustAvoid.some((value) => normalizeMatch(value).length >= 2 && normalized.includes(normalizeMatch(value)));
-  };
-  const matchesHardStyles = (row) => {
-    if (!hardStyles.length) return true;
-    const profile = payloadById.get(Number(row.id))?.experienceProfile;
-    if (!profile) return false;
-    return hardStyles.every((hardStyle) => profile.style.some((style) => {
-      const required = normalizedStyle(hardStyle);
-      const actual = normalizedStyle(style);
-      return actual === required || actual.includes(required);
-    }));
-  };
+  // Tag filters and mustAvoid already ran at recall; excluded artists are re-checked here for reference songs.
+  const violatesMustAvoid = (row) => excludedArtists.length > 0 && includesArtist(row, excludedArtists);
   const seen = new Set();
   const playlist = [];
   const artistCounts = new Map();
   const hardArtists = Array.isArray(planning.value.hardArtists) ? planning.value.hardArtists.filter(Boolean) : [];
   const maxPerArtist = hardArtists.length ? Infinity : includedSeeds.length ? 2 : 3;
-  const artistKey = (row) => normalizeMatch(row.artist);
-  const canAddArtist = (row, isReference = false) => isReference || (artistCounts.get(artistKey(row)) || 0) < maxPerArtist;
-  const recordArtist = (row) => artistCounts.set(artistKey(row), (artistCounts.get(artistKey(row)) || 0) + 1);
+  // Count every credited artist, so "A&周杰伦" and "周杰伦&B" both use up 周杰伦's allowance.
+  const canAddArtist = (row, isReference = false) => isReference || splitArtists(row.artist).every((artist) => (artistCounts.get(artist) || 0) < maxPerArtist);
+  const recordArtist = (row) => { for (const artist of splitArtists(row.artist)) artistCounts.set(artist, (artistCounts.get(artist) || 0) + 1); };
   for (const selection of Array.isArray(modelResult.selections) ? modelResult.selections : []) {
     const id = Number(selection.id);
     const row = candidateMap.get(id);
     const isIncludedReference = includedSeeds.some((seed) => Number(seed.id) === id);
-    if (!row || seen.has(id) || !canAddArtist(row, isIncludedReference) || (!isIncludedReference && (!matchesHardStyles(row) || violatesMustAvoid(row)))) continue;
+    if (!row || seen.has(id) || !canAddArtist(row, isIncludedReference) || (!isIncludedReference && violatesMustAvoid(row))) continue;
     seen.add(id);
     recordArtist(row);
     playlist.push({ ...serializeTrack(row), score: 0, reason: String(selection.reason || "符合你此刻的听歌需求。"), evidence: Array.isArray(selection.evidence) ? selection.evidence.slice(0, 5) : [] });
@@ -755,15 +519,13 @@ referenceTracks必须覆盖所有识别出的参考歌，不得填写 referenced
     }
   }
   if (playlist.length > count) playlist.length = count;
-  const fallbackCandidates = candidateEntries.filter((entry) => (!hardStyles.length || matchesHardStyles(entry.row)) && !violatesMustAvoid(entry.row) && (entry.tier === "direct" || entry.tier === "related"));
-  for (const entry of fallbackCandidates) {
-    const row = entry.row;
+  // Fallback fill: only songs an LLM batch already approved.
+  for (const item of vectorPool) {
+    const row = item.row;
     if (playlist.length >= count) break;
-    if (!seen.has(row.id) && canAddArtist(row)) {
-      const tierText = entry.tier === "direct" ? "直接证据" : entry.tier === "related" ? "关联证据" : "探索候选";
-      playlist.push({ ...serializeTrack(row), score: 0,
-        reason: `本地听感档案提供了${tierText}，作为候选补入。`,
-        evidence: entry.evidence.slice(0, 4) });
+    if (!seen.has(row.id) && canAddArtist(row) && !violatesMustAvoid(row)) {
+      playlist.push({ ...serializeTrack(row), score: 0, reason: "分批精排中被判定符合需求，作为候选补入。",
+        evidence: [`需求匹配 ${round3(item.queryScore)} · 口味匹配 ${round3(item.personalScore)}`] });
       seen.add(Number(row.id));
       recordArtist(row);
     }
@@ -774,7 +536,7 @@ referenceTracks必须覆盖所有识别出的参考歌，不得填写 referenced
     avoid: Array.isArray(modelResult.intent?.avoid) ? modelResult.intent.avoid.slice(0, 8) : [],
     softPreferences: Array.isArray(modelResult.intent?.softPreferences) ? modelResult.intent.softPreferences.slice(0, 8) : [],
   };
-  const totalTokens = Number(planning.usage?.total_tokens || 0) + Number(ranking.usage?.total_tokens || 0);
+  const totalTokens = Number(planning.usage?.total_tokens || 0) + rankingTokens;
   const title = String(modelResult.title || "此刻歌单");
   const summary = String(modelResult.summary || "根据你的表达、参考歌曲和音乐记忆生成。");
   let recommendationId;
@@ -848,15 +610,23 @@ if (!db.prepare("SELECT 1 FROM preference_statements WHERE source='prompt_signal
   }
 }
 
+{
+  const remapped = remapUnavailableTracks();
+  if (remapped.mapped) console.log("Re-pointed references to removed files:", JSON.stringify(remapped));
+}
+
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
     if (request.method === "OPTIONS") { response.writeHead(204, corsHeaders()); return response.end(); }
+    if (await handleEvalRoute(request, response, url, { sendJson, readJson })) return;
+    if (await handleCommentRoute(request, response, url, { sendJson, readJson })) return;
+    if (request.method === "GET" && url.pathname === "/api/history") return sendJson(response, 200, buildHistory());
     if (request.method === "GET" && url.pathname === "/api/health") {
       const count = db.prepare(`SELECT COUNT(*) AS count FROM (
         SELECT 1 FROM tracks WHERE available=1 GROUP BY lower(trim(title)), lower(trim(artist))
       )`).get().count;
-      return sendJson(response, 200, { ok: true, count, libraryRoot, scan: scanState, ai: { configured: Boolean(deepseekApiKey && !/在这里|填入|your/i.test(deepseekApiKey)), model: deepseekModel } });
+      return sendJson(response, 200, { ok: true, count, libraryRoot, scan: scanState, ai: { configured: !isPlaceholderKey(deepseekApiKey), model: deepseekModel } });
     }
     if (request.method === "POST" && url.pathname === "/api/library/scan") {
       scanLibrary().catch(console.error);
@@ -864,14 +634,23 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/library/scan") return sendJson(response, 200, scanState);
     if (request.method === "GET" && url.pathname === "/api/tracks") {
-      const limit = Math.min(2000, Math.max(1, Number(url.searchParams.get("limit") || 2000)));
+      const limit = Math.min(20000, Math.max(1, Number(url.searchParams.get("limit") || 20000)));
       const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
       const query = url.searchParams.get("q")?.trim();
       const physicalRows = query
         ? db.prepare("SELECT * FROM tracks WHERE available=1 AND (title LIKE ? OR artist LIKE ? OR album LIKE ?) ORDER BY artist, title, play_count DESC, COALESCE(bitrate,0) DESC, id").all(`%${query}%`, `%${query}%`, `%${query}%`)
         : db.prepare("SELECT * FROM tracks WHERE available=1 ORDER BY artist, title, play_count DESC, COALESCE(bitrate,0) DESC, id").all();
       const logicalRows = dedupeTrackRows(physicalRows);
-      return sendJson(response, 200, { total: logicalRows.length, tracks: logicalRows.slice(offset, offset + limit).map(serializeTrack) });
+      // Total plays per logical song: YouTube history + plays in this app, summed over every copy.
+      const playsByKey = new Map();
+      const eventPlays = new Map(db.prepare("SELECT track_id, COUNT(*) AS plays FROM listening_events WHERE event_type='play' AND track_id IS NOT NULL GROUP BY track_id").all()
+        .map((row) => [Number(row.track_id), row.plays]));
+      for (const row of physicalRows) {
+        const key = logicalTrackKey(row);
+        playsByKey.set(key, (playsByKey.get(key) || 0) + (eventPlays.get(Number(row.id)) || 0));
+      }
+      return sendJson(response, 200, { total: logicalRows.length, tracks: logicalRows.slice(offset, offset + limit)
+        .map((row) => ({ ...serializeTrack(row), totalPlays: playsByKey.get(logicalTrackKey(row)) || 0 })) });
     }
     if (request.method === "POST" && url.pathname === "/api/recommendations") {
       const body = await readJson(request);
@@ -879,13 +658,14 @@ const server = createServer(async (request, response) => {
       if (!prompt) return sendJson(response, 400, { error: "请描述此刻想听的音乐" });
       const countMention = prompt.match(/(?:生成|给我|要|想听)?\s*([1-9]|[12]\d|30)\s*首/);
       const count = Math.min(30, Math.max(1, countMention ? Number(countMention[1]) : Number(body.count || 10)));
-      const mix = body.mix && typeof body.mix === "object" ? body.mix : { familiar: 50, forgotten: 20, discover: 30 };
+      // mixMode "auto" (or no mix) lets the planner pick the ratio from the situation; ratios in the request text always win.
+      const mix = body.mixMode !== "auto" && body.mix && typeof body.mix === "object" ? body.mix : null;
       const seedTrackIds = Array.isArray(body.seedTrackIds) ? body.seedTrackIds : [];
       const requestText = prompt.slice(0, 1000);
       const requestLog = db.prepare("INSERT INTO request_logs (request_text, requested_count, mix_json) VALUES (?, ?, ?)").run(requestText, count, JSON.stringify(mix));
       const requestLogId = Number(requestLog.lastInsertRowid);
       try {
-        const recommendation = await generateRecommendation(requestText, mix, count, seedTrackIds);
+        const recommendation = await generateRecommendation(requestText, mix, count, seedTrackIds, { embeddingVariant: body.embeddingVariant });
         db.prepare("UPDATE request_logs SET status='succeeded', recommendation_id=?, completed_at=CURRENT_TIMESTAMP WHERE id=?").run(recommendation.id, requestLogId);
         return sendJson(response, 200, recommendation);
       } catch (error) {
@@ -978,164 +758,6 @@ const server = createServer(async (request, response) => {
       db.prepare("UPDATE user_playlists SET updated_at=CURRENT_TIMESTAMP WHERE id=1").run();
       return sendJson(response, 200, { ok: true, favorite: request.method === "PUT", playlists: userPlaylistRows() });
     }
-    if (request.method === "GET" && url.pathname === "/api/similarity/calibration") {
-      return sendJson(response, 200, { tracks: calibrationRows(), comparisons: comparisonRows() });
-    }
-    const calibrationTrackMatch = url.pathname.match(/^\/api\/similarity\/calibration\/(\d+)$/);
-    if (calibrationTrackMatch && ["POST", "DELETE"].includes(request.method)) {
-      const trackId = Number(calibrationTrackMatch[1]);
-      if (!db.prepare("SELECT id FROM tracks WHERE id=?").get(trackId)) return sendJson(response, 404, { error: "歌曲不存在" });
-      if (request.method === "POST") {
-        const count = db.prepare("SELECT COUNT(*) AS count FROM similarity_calibration_tracks").get().count;
-        if (count >= 30 && !db.prepare("SELECT track_id FROM similarity_calibration_tracks WHERE track_id=?").get(trackId)) return sendJson(response, 400, { error: "校准集合最多保存30首歌曲" });
-        db.prepare("INSERT OR IGNORE INTO similarity_calibration_tracks (track_id) VALUES (?)").run(trackId);
-      } else {
-        db.prepare("DELETE FROM similarity_annotations WHERE track_id=?").run(trackId);
-        db.prepare("DELETE FROM similarity_calibration_tracks WHERE track_id=?").run(trackId);
-      }
-      return sendJson(response, 200, { ok: true, tracks: calibrationRows() });
-    }
-    const calibrationDraftMatch = url.pathname.match(/^\/api\/similarity\/calibration\/(\d+)\/draft$/);
-    if (request.method === "POST" && calibrationDraftMatch) {
-      const trackId = Number(calibrationDraftMatch[1]);
-      const track = db.prepare("SELECT id, title, artist, album, genre, year, folder FROM tracks WHERE id=?").get(trackId);
-      if (!track) return sendJson(response, 404, { error: "歌曲不存在" });
-      if (!db.prepare("SELECT track_id FROM similarity_calibration_tracks WHERE track_id=?").get(trackId)) return sendJson(response, 404, { error: "请先把歌曲加入校准集合" });
-      const dimensionGuide = {
-        emotion: "情绪性质：方向、唤醒、力量、释放、明暗质地",
-        dynamics: "情绪动态：积累方式、副歌抬升、段落对比、峰值和结尾",
-        vocal: "演唱姿态：克制或外放、张力、距离、合唱感、音色质地",
-        melody: "旋律体验：鲜明度、跟唱感、音域、起伏、副歌钩子",
-        rhythm: "节奏推进：推进感、律动、稳定、冲击、速度感",
-        arrangement: "编曲空间：密度、空间、原声或电子、层次、副歌扩张",
-        narrative: "主题姿态：主动或被动、勇敢或犹疑、对抗或接受、行动感",
-        culture: "文化体验：语言地域、时代质感、共同记忆、表演文化和场景",
-      };
-      const draftSystem = `你是音乐相似性标注的初稿助手，而不是事实裁判。你只能依据给出的歌曲元数据和你对知名作品的已有知识提出待审核草稿；你没有听到音频，也没有看到歌词，不得伪装成已完成音频分析。知识不足时必须明确写“信息不足，待人工确认”。
-对八个维度分别返回 observation、boundary、evidence。observation用完整句子描述该维度；boundary说明容易混淆但并不等同的特征。元数据仅包含歌名、歌手、专辑、流派和年份，不能证明情绪、旋律、节奏、动态、演唱或编曲；这些判断即使你熟悉作品，也必须把evidence写成“模型已有知识（未核验）；未进行音频或歌词分析”。只有直接复述元数据字段时才能写“歌曲元数据”。不能捏造具体音频证据。
-只返回JSON：{"annotations":{"emotion":{"observation":"","boundary":"","evidence":""},"dynamics":{},"vocal":{},"melody":{},"rhythm":{},"arrangement":{},"narrative":{},"culture":{}}}。`;
-      const draft = await deepseekJson(draftSystem, { track, dimensionGuide }, 2600);
-      const annotations = {};
-      for (const key of Object.keys(dimensionGuide)) {
-        const item = draft.value?.annotations?.[key] || {};
-        annotations[key] = {
-          observation: String(item.observation || "信息不足，待人工确认").slice(0, 1500),
-          boundary: String(item.boundary || "信息不足，待人工确认").slice(0, 1500),
-          evidence: String(item.evidence || "信息不足").slice(0, 1000),
-          source: "llm_draft",
-        };
-      }
-      return sendJson(response, 200, { ok: true, annotations, model: draft.model, usage: draft.usage });
-    }
-    const experienceProfileMatch = url.pathname.match(/^\/api\/similarity\/calibration\/(\d+)\/profile$/);
-    if (request.method === "PUT" && experienceProfileMatch) {
-      const trackId = Number(experienceProfileMatch[1]);
-      const track = db.prepare("SELECT id, title, artist FROM tracks WHERE id=? AND available=1").get(trackId);
-      if (!track) return sendJson(response, 404, { error: "歌曲不存在或文件已移除" });
-      const body = await readJson(request);
-      const cleanTags = (value) => Array.isArray(value) ? [...new Set(value.map((item) => String(item).trim()).filter(Boolean))].slice(0, 8) : [];
-      const style = cleanTags(body.style);
-      const felt = cleanTags(body.feltExperience);
-      const energy = cleanTags(body.energyArc);
-      const sound = cleanTags(body.sound);
-      const identity = String(body.identity || "").trim().slice(0, 1200);
-      const avoid = String(body.avoid || "").trim().slice(0, 1200);
-      if (!style.length || !felt.length || !energy.length || !sound.length || !identity || !avoid) return sendJson(response, 400, { error: "五类听感档案都需要填写" });
-      const source = body.source === "user_calibrated" ? "user_calibrated" : "codex_curated";
-      const reviewStatus = body.reviewStatus === "approved" ? "approved" : "needs_user_review";
-      const upsertProfile = db.prepare(`INSERT INTO song_experience_profiles
-        (track_id, style_json, felt_json, energy_json, sound_json, identity_text, avoid_text, source, review_status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(track_id) DO UPDATE SET style_json=excluded.style_json, felt_json=excluded.felt_json,
-        energy_json=excluded.energy_json, sound_json=excluded.sound_json, identity_text=excluded.identity_text,
-        avoid_text=excluded.avoid_text, source=excluded.source, review_status=excluded.review_status,
-        notes=excluded.notes, updated_at=CURRENT_TIMESTAMP`);
-      const matchingTracks = db.prepare(`SELECT id FROM tracks WHERE available=1
-        AND lower(trim(title))=lower(trim(?)) AND lower(trim(artist))=lower(trim(?))`).all(track.title, track.artist);
-      db.exec("BEGIN");
-      try {
-        for (const matching of matchingTracks) upsertProfile.run(
-          matching.id, JSON.stringify(style), JSON.stringify(felt), JSON.stringify(energy), JSON.stringify(sound),
-          identity, avoid, source, reviewStatus, String(body.notes || "").trim().slice(0, 1200),
-        );
-        db.prepare(`UPDATE similarity_calibration_tracks SET status=?, updated_at=CURRENT_TIMESTAMP
-          WHERE track_id IN (SELECT id FROM tracks WHERE available=1
-            AND lower(trim(title))=lower(trim(?)) AND lower(trim(artist))=lower(trim(?)))`).run(reviewStatus, track.title, track.artist);
-        db.exec("COMMIT");
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-      return sendJson(response, 200, { ok: true, tracks: calibrationRows() });
-    }
-    const annotationMatch = url.pathname.match(/^\/api\/similarity\/calibration\/(\d+)\/annotations\/([a-z_]+)$/);
-    if (request.method === "PUT" && annotationMatch) {
-      const trackId = Number(annotationMatch[1]);
-      const dimension = annotationMatch[2];
-      const allowedDimensions = new Set(["emotion", "dynamics", "vocal", "melody", "rhythm", "arrangement", "narrative", "culture"]);
-      if (!allowedDimensions.has(dimension)) return sendJson(response, 400, { error: "未知的相似性维度" });
-      if (!db.prepare("SELECT track_id FROM similarity_calibration_tracks WHERE track_id=?").get(trackId)) return sendJson(response, 404, { error: "请先把歌曲加入校准集合" });
-      const body = await readJson(request);
-      const observation = String(body.observation || "").trim().slice(0, 1500);
-      const boundary = String(body.boundary || "").trim().slice(0, 1500);
-      const evidence = String(body.evidence || "").trim().slice(0, 1000);
-      const source = ["manual", "llm_draft", "codex_reviewed", "human_reviewed"].includes(body.source) ? body.source : "manual";
-      db.prepare(`INSERT INTO similarity_annotations (track_id, dimension_key, observation, boundary, evidence, source)
-        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(track_id, dimension_key) DO UPDATE SET
-        observation=excluded.observation, boundary=excluded.boundary, evidence=excluded.evidence,
-        source=excluded.source, updated_at=CURRENT_TIMESTAMP`).run(trackId, dimension, observation, boundary, evidence, source);
-      db.prepare("UPDATE similarity_calibration_tracks SET updated_at=CURRENT_TIMESTAMP WHERE track_id=?").run(trackId);
-      return sendJson(response, 200, { ok: true, tracks: calibrationRows() });
-    }
-    if (request.method === "POST" && url.pathname === "/api/similarity/comparisons/draft") {
-      const entries = calibrationRows();
-      if (entries.length < 4) return sendJson(response, 400, { error: "至少需要4首校准歌曲" });
-      const payload = entries.map((entry) => ({
-        id: Number(entry.track.id.replace("local-", "")), title: entry.track.title, artist: entry.track.artist,
-        dimensions: Object.fromEntries(Object.entries(entry.annotations).map(([key, value]) => [key, { observation: value.observation, boundary: value.boundary }])),
-      }));
-      const system = `你是音乐相似性标注体系的校准策划器。请从提供的歌曲中挑选8组有验证价值的两两比较：既要有表面相似但关键维度不同的反例，也要有跨年代或语言但核心体验相似的正例。只能使用提供的歌曲ID和维度描述，不得补充未提供的音频事实。
-每组选择1到3个最关键维度，说明相似在哪里、不同在哪里，以及使用了哪些已提供标注作为证据。不要仅按歌手、语言或年代配对。
-只返回JSON：{"pairs":[{"leftId":1,"rightId":2,"dimensions":["emotion"],"similarity":"","difference":"","evidence":""}]}。`;
-      const result = await deepseekJson(system, { tracks: payload }, 3600);
-      const allowedIds = new Set(payload.map((item) => item.id));
-      const allowedDimensions = new Set(["emotion", "dynamics", "vocal", "melody", "rhythm", "arrangement", "narrative", "culture"]);
-      const saved = [];
-      for (const pair of Array.isArray(result.value?.pairs) ? result.value.pairs.slice(0, 8) : []) {
-        const leftId = Number(pair.leftId); const rightId = Number(pair.rightId);
-        const dimensions = (Array.isArray(pair.dimensions) ? pair.dimensions : []).filter((item) => allowedDimensions.has(item)).slice(0, 3);
-        const similarity = String(pair.similarity || "").trim().slice(0, 2000);
-        const difference = String(pair.difference || "").trim().slice(0, 2000);
-        const evidence = String(pair.evidence || "").trim().slice(0, 1000);
-        if (!allowedIds.has(leftId) || !allowedIds.has(rightId) || leftId === rightId || !dimensions.length || !similarity || !difference) continue;
-        db.prepare(`INSERT INTO similarity_comparisons
-          (left_track_id, right_track_id, dimensions_json, similarity_text, difference_text, evidence, source, review_status)
-          VALUES (?, ?, ?, ?, ?, ?, 'llm_draft', 'codex_qa')`).run(leftId, rightId, JSON.stringify(dimensions), similarity, difference,
-            `基于本地校准标注的模型组合（未进行音频分析）；${evidence}`.slice(0, 1000));
-        saved.push([leftId, rightId]);
-      }
-      return sendJson(response, 201, { ok: true, saved: saved.length, comparisons: comparisonRows(), model: result.model, usage: result.usage });
-    }
-    if (request.method === "POST" && url.pathname === "/api/similarity/comparisons") {
-      const body = await readJson(request);
-      const leftId = Number(String(body.leftTrackId || "").replace("local-", ""));
-      const rightId = Number(String(body.rightTrackId || "").replace("local-", ""));
-      if (!leftId || !rightId || leftId === rightId) return sendJson(response, 400, { error: "请选择两首不同的歌曲" });
-      const dimensions = (Array.isArray(body.dimensions) ? body.dimensions : []).filter((item) => typeof item === "string").slice(0, 8);
-      const similarity = String(body.similarity || "").trim().slice(0, 2000);
-      const difference = String(body.difference || "").trim().slice(0, 2000);
-      const evidence = String(body.evidence || "").trim().slice(0, 1000);
-      if (!dimensions.length || !similarity || !difference) return sendJson(response, 400, { error: "请选择比较维度，并写清相似与不同之处" });
-      db.prepare(`INSERT INTO similarity_comparisons
-        (left_track_id, right_track_id, dimensions_json, similarity_text, difference_text, evidence, source, review_status)
-        VALUES (?, ?, ?, ?, ?, ?, 'human_reviewed', 'approved')`).run(leftId, rightId, JSON.stringify(dimensions), similarity, difference, evidence);
-      return sendJson(response, 201, { ok: true, comparisons: comparisonRows() });
-    }
-    const comparisonMatch = url.pathname.match(/^\/api\/similarity\/comparisons\/(\d+)$/);
-    if (request.method === "DELETE" && comparisonMatch) {
-      db.prepare("DELETE FROM similarity_comparisons WHERE id=?").run(Number(comparisonMatch[1]));
-      return sendJson(response, 200, { ok: true, comparisons: comparisonRows() });
-    }
     if (request.method === "GET" && url.pathname === "/api/memories") {
       return sendJson(response, 200, { memories: memoryRows(), recentRequests: requestLogRows(20) });
     }
@@ -1220,6 +842,17 @@ const server = createServer(async (request, response) => {
       const id = Number(playMatch[1]);
       db.prepare("UPDATE tracks SET play_count=play_count+1, last_played_at=CURRENT_TIMESTAMP WHERE id=?").run(id);
       db.prepare("INSERT INTO play_events (track_id, event_type) VALUES (?, 'play')").run(id);
+      db.prepare("INSERT INTO listening_events (source, event_type, track_id, context, created_at) VALUES ('moment', 'play', ?, '', ?)").run(id, new Date().toISOString());
+      return sendJson(response, 200, { ok: true });
+    }
+    const listenEventMatch = url.pathname.match(/^\/api\/tracks\/(\d+)\/events$/);
+    if (request.method === "POST" && listenEventMatch) {
+      const id = Number(listenEventMatch[1]);
+      const body = await readJson(request);
+      if (!["complete", "skip", "partial"].includes(body.type)) return sendJson(response, 400, { error: "未知的播放事件" });
+      if (!db.prepare("SELECT id FROM tracks WHERE id=?").get(id)) return sendJson(response, 404, { error: "歌曲不存在" });
+      const playedSeconds = Number.isFinite(Number(body.playedSeconds)) ? Math.max(0, Number(body.playedSeconds)) : null;
+      db.prepare("INSERT INTO listening_events (source, event_type, track_id, played_seconds, context, created_at) VALUES ('moment', ?, ?, ?, '', ?)").run(body.type, id, playedSeconds, new Date().toISOString());
       return sendJson(response, 200, { ok: true });
     }
     return sendJson(response, 404, { error: "Not found" });

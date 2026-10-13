@@ -55,3 +55,13 @@ local-music/*.db-wal
 /.wrangler/
 /outputs/
 /work/
+
+# personal listening history export (private)
+/YouTube and YouTube Music/
+
+# offline evaluation reports (derived from private listening data)
+/local-music/eval-results/
+/logs/
+/local-music/batch-jobs.json
+tsconfig.tsbuildinfo
+/local-music/backups/
