@@ -7,6 +7,9 @@ try { process.loadEnvFile(join(projectRoot, ".env.local")); } catch { /* optiona
 export const libraryRoot = resolve(process.env.MUSIC_LIBRARY_PATH || join(projectRoot, "..", "music-repo"));
 export const databasePath = resolve(process.env.MUSIC_DATABASE_PATH || join(here, "music-library.sqlite"));
 export const port = Number(process.env.MUSIC_SERVER_PORT || 3001);
+// Deployed behind a reverse proxy on one domain: PUBLIC_BASE_URL="" makes audio URLs same-origin.
+export const publicBaseUrl = process.env.PUBLIC_BASE_URL ?? `http://localhost:${port}`;
+export const corsOrigin = process.env.CORS_ORIGIN || "http://localhost:3000";
 // Planner/ranker LLM. LLM_PROVIDER=modelproxy routes the same OpenAI-compatible calls through the
 // company ModelProxy (budget pool) instead of the personal DeepSeek account; the DEEPSEEK_* values stay as they are.
 const viaProxy = process.env.LLM_PROVIDER === "modelproxy";

@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 import type { Track, TrackKind } from "../../lib/music";
 
-export const apiBase = "http://localhost:3001";
+// Local development talks to the API on :3001; a deployed build is served from the same origin as the API.
+export const apiBase = typeof window !== "undefined" && !["localhost", "127.0.0.1"].includes(window.location.hostname) ? "" : "http://localhost:3001";
 
 export const kindLabel: Record<TrackKind, string> = { familiar: "近期熟悉", forgotten: "遗忘旧爱", discover: "新发现", library: "没听过" };
 

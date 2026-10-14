@@ -1,0 +1,20 @@
+# Moment on one origin: static frontend + /api reverse-proxied to the Node service (127.0.0.1:3001).
+# Basic auth guards everything, including audio; the password hash lives in /srv/moment/caddy-auth.
+{$MOMENT_HOST} {
+	encode zstd gzip
+	basic_auth {
+		import /srv/moment/caddy-auth
+	}
+	handle /api/* {
+		reverse_proxy 127.0.0.1:3001 {
+			flush_interval -1
+		}
+	}
+	handle {
+		root * /srv/moment/app/dist/static
+		try_files {path} /index.html
+		file_server
+	}
+	@assets path /_next/static/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+}

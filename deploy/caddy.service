@@ -1,0 +1,15 @@
+[Unit]
+Description=Caddy (Moment)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=admin
+Environment=XDG_DATA_HOME=/srv/moment/caddy-data
+EnvironmentFile=/srv/moment/caddy.env
+ExecStart=/usr/local/bin/caddy run --config /srv/moment/app/deploy/Caddyfile --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /srv/moment/app/deploy/Caddyfile --adapter caddyfile
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

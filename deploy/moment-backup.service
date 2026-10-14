@@ -1,0 +1,9 @@
+[Unit]
+Description=Moment database backup to OSS
+
+[Service]
+Type=oneshot
+User=admin
+WorkingDirectory=/srv/moment/app
+EnvironmentFile=/srv/moment/app/.env.local
+ExecStart=/usr/local/bin/node scripts/backup-db.mjs

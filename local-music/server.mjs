@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { extname, join, relative, resolve, sep } from "node:path";
 import { parseFile } from "music-metadata";
-import { dashscopeApiKey, deepseekApiKey, deepseekModel, isPlaceholderKey, libraryRoot, port, supportedExtensions } from "./config.mjs";
+import { corsOrigin, dashscopeApiKey, deepseekApiKey, deepseekModel, isPlaceholderKey, libraryRoot, port, publicBaseUrl, supportedExtensions } from "./config.mjs";
 import { db, safeJson } from "./db.mjs";
 import { deepseekJson } from "./llm.mjs";
 import { familiarityForRow, getUserProfile, personalSignals, rankingConfig } from "./personalization.mjs";
@@ -140,13 +140,13 @@ function serializeTrack(input) {
     tags, instruments: [], color: ["green", "orange", "violet", "blue", "gold", "cyan"][row.id % 6],
     duration: row.duration, bitrate: bitrateKbps, folder: row.folder,
     playCount: row.play_count, lastPlayedAt: row.last_played_at,
-    audioUrl: missing ? undefined : `http://localhost:${port}/api/tracks/${row.id}/audio`, missing, blocked: isBlocked(row),
+    audioUrl: missing ? undefined : `${publicBaseUrl}/api/tracks/${row.id}/audio`, missing, blocked: isBlocked(row),
     ...moodFields(row.id),
   };
 }
 
 function corsHeaders() {
-  return { "Access-Control-Allow-Origin": "http://localhost:3000", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS" };
+  return { "Access-Control-Allow-Origin": corsOrigin, "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS" };
 }
 
 async function readJson(request) {

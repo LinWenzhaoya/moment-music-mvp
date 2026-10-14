@@ -1,0 +1,15 @@
+[Unit]
+Description=Moment music API
+After=network-online.target mnt-oss.mount
+Wants=network-online.target
+
+[Service]
+User=admin
+WorkingDirectory=/srv/moment/app
+EnvironmentFile=/srv/moment/app/.env.local
+ExecStart=/usr/local/bin/node local-music/server.mjs
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
