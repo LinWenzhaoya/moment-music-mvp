@@ -9,7 +9,7 @@ export type RecommendationPlan = { intentSummary?: string; hardArtists?: string[
 type Props = {
   source: "ai" | "user"; title: string; summary: string; request?: string; plan: RecommendationPlan | null;
   tracks: RecommendedTrack[]; playingId: string | null; isPlaying: boolean; isGenerating: boolean;
-  onPlay: (track: Track) => void; onBack: () => void; onRegenerate: () => void; onRemove: (track: Track) => void;
+  onPlay: (track: Track) => void; onBack: () => void; onRegenerate: (variation: "refresh" | "shift") => void; onRemove: (track: Track) => void;
   handlers: RowHandlers; tagCache: Record<string, SongTags | null>;
 };
 
@@ -50,7 +50,8 @@ export function PlaylistView(props: Props) {
 
     <div className="playlist-toolbar">
       <button className="play-fab" onClick={() => tracks[0] && props.onPlay(tracks[0])} aria-label="播放全部"><Icon name="play" size={24} /></button>
-      {props.source === "ai" && <button className="ghost-button" onClick={props.onRegenerate} disabled={props.isGenerating}><Icon name="refresh" size={16} />{props.isGenerating ? "正在生成" : "换一批"}</button>}
+      {props.source === "ai" && <button className="ghost-button" onClick={() => props.onRegenerate("refresh")} disabled={props.isGenerating} title="同样的需求，换一批没出现过的歌"><Icon name="refresh" size={16} />{props.isGenerating ? "正在生成" : "换一批"}</button>}
+      {props.source === "ai" && <button className="ghost-button" onClick={() => props.onRegenerate("shift")} disabled={props.isGenerating} title="同样的心情，换一种曲风和歌手"><Icon name="shuffle" size={16} />换个口味</button>}
       {props.source === "ai" && <button className={`ghost-button ${showTrace ? "on" : ""}`} onClick={() => setShowTrace((open) => !open)}>推荐链路</button>}
       <span className="muted toolbar-meta">{tracks.length} 首 · 约 {minutes} 分钟</span>
     </div>
@@ -69,7 +70,7 @@ export function PlaylistView(props: Props) {
         return <div className={`song-row-wrap ${active ? "active" : ""}`} key={track.id}>
           <div className="song-row">
             <span className={`row-index ${active ? "active" : ""}`}>{index + 1}</span>
-            <TrackCell track={track} active={active} playing={props.isPlaying} onPlay={() => props.onPlay(track)} />
+            <TrackCell track={track} active={active} playing={props.isPlaying} onPlay={() => props.onPlay(track)} showChips={false} />
             <span className="reason" title={track.reason}>{track.reason}</span>
             <KindBadge kind={track.kind} />
             <span className="right muted tabular">{formatTime(track.duration)}</span>

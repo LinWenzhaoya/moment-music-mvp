@@ -1,13 +1,53 @@
 {
-  "recall": { "multiplier": 5, "min": 40, "max": 120, "referenceBlend": 0.4, "embeddingVariant": "desc" },
-  "score": { "alpha": 0.7, "beta": 0.3 },
-  "personal": { "clusterWeight": 0.6, "behaviorWeight": 0.4 },
+  "recall": {
+    "multiplier": 5,
+    "min": 40,
+    "max": 120,
+    "referenceBlend": 0.4,
+    "embeddingVariant": "desc"
+  },
+  "score": {
+    "alpha": 0.7,
+    "beta": 0.3
+  },
+  "personal": {
+    "clusterWeight": 0.6,
+    "behaviorWeight": 0.4
+  },
   "behavior": {
     "halfLifeDays": 180,
-    "points": { "like": 4, "moment_favorite": 4, "playlist_add": 3, "complete": 2, "play": 1, "partial": 0.5, "skip": -3, "feedback_like": 4, "feedback_dislike": -4 },
+    "points": {
+      "like": 4,
+      "moment_favorite": 4,
+      "playlist_add": 3,
+      "complete": 2,
+      "play": 1,
+      "partial": 0.5,
+      "skip": -3,
+      "feedback_like": 4,
+      "feedback_dislike": -4
+    },
     "momentPlayPoints": 0
   },
-  "clusters": { "kMin": 2, "kMax": 8, "minSongs": 12, "rebuildEveryEvents": 30 },
-  "familiarity": { "forgottenDays": 90 },
-  "llm": { "batches": 3, "perBatchRatio": 0.6 }
+  "clusters": {
+    "kMin": 2,
+    "kMax": 8,
+    "minSongs": 12,
+    "rebuildEveryEvents": 30
+  },
+  "familiarity": {
+    "forgottenDays": 90
+  },
+  "llm": {
+    "batches": 3,
+    "perBatchRatio": 0.6
+  },
+  "freshness": {
+    "windowDays": 14,
+    "halfLifeDays": 3,
+    "penalty": 0.02,
+    "maxExposure": 3,
+    "jitter": 0.008,
+    "shiftStrength": 0.6
+  }
 }

@@ -25,6 +25,7 @@ export type Track = {
   language?: string | null;
   instrumental?: boolean;
   missing?: boolean;
+  blocked?: boolean;
   lastPlayedAt?: string | null;
 };
 

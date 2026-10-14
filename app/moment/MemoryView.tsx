@@ -34,8 +34,10 @@ function Statement({ memory, onEdit, onDelete }: { memory: MemoryRecord; onEdit:
   </article>;
 }
 
-export function MemoryView({ memories, recentRequests, favoriteTracks, onNew, onEdit, onDelete, onPlay }: {
-  memories: MemoryRecord[]; recentRequests: RequestMemory[]; favoriteTracks: Track[];
+export type SongBlock = { song_key: string; track_id: number | null; title: string; artist: string; created_at: string };
+
+export function MemoryView({ memories, recentRequests, favoriteTracks, blocks, onUnblock, onNew, onEdit, onDelete, onPlay }: {
+  memories: MemoryRecord[]; recentRequests: RequestMemory[]; favoriteTracks: Track[]; blocks: SongBlock[]; onUnblock: (block: SongBlock) => void;
   onNew: (category?: MemoryCategory) => void; onEdit: (memory: MemoryRecord) => void; onDelete: (memory: MemoryRecord) => void; onPlay: (track: Track) => void;
 }) {
   const confirmed = memories.filter((item) => item.status === "confirmed");
@@ -55,6 +57,10 @@ export function MemoryView({ memories, recentRequests, favoriteTracks, onNew, on
     </div>
     {pending.length > 0 && <section className="panel-block"><div className="section-head"><h2>待确认的观察</h2><span>确认、修改或忽略后才会参与推荐</span></div>
       {pending.map((memory) => <div className="pending-item" key={memory.id}><span>{memory.statement}</span><button className="text-button" onClick={() => onEdit(memory)}>确认或修改</button><button className="text-button" onClick={() => onDelete(memory)}>不保存</button></div>)}</section>}
+    <section className="panel-block"><div className="section-head"><h2>不喜欢的歌</h2><span>在播放条点过“不喜欢”的歌，永远不会出现在 AI 歌单里</span></div>
+      {blocks.length ? <div className="block-list">{blocks.map((block) => <div className="block-item" key={block.song_key}>
+        <span><b>{block.title}</b><span className="muted"> · {block.artist}</span></span><button className="text-button" onClick={() => onUnblock(block)}>撤销</button></div>)}</div>
+        : <div className="empty">还没有。播放时觉得不对，点播放条上的 👎 即可。</div>}</section>
     {sections.map((section) => <section className="panel-block" key={section.category}>
       <div className="section-head"><h2>{section.title}</h2><span>{section.hint}</span><button className="text-button" onClick={() => onNew(section.category)}>＋ 新增</button></div>
       {group(section.category).length ? <div className="memory-grid">{group(section.category).map((memory) => <Statement key={memory.id} memory={memory} onEdit={onEdit} onDelete={onDelete} />)}</div>

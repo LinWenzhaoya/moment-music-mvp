@@ -7,7 +7,7 @@ import { EvalView, type EvalStatus } from "./moment/EvalView";
 import { HistoryView, type PlayHistory } from "./moment/HistoryView";
 import { HomeView } from "./moment/HomeView";
 import { LibraryView } from "./moment/LibraryView";
-import { mapMemories, type MemoryCategory, type MemoryRecord, MemoryView, type RequestMemory } from "./moment/MemoryView";
+import { mapMemories, type MemoryCategory, type MemoryRecord, MemoryView, type RequestMemory, type SongBlock } from "./moment/MemoryView";
 import { type FeedbackDraft, FeedbackModal, type MemoryDraft, MemoryEditor, PlaylistPicker } from "./moment/Modals";
 import { JournalView, NowPlayingPanel, PlayerBar, type SongComment } from "./moment/Player";
 import { AiPlaylistsView, type SavedPlaylist, type UserPlaylist, UserPlaylistsView } from "./moment/PlaylistsViews";
@@ -149,6 +149,13 @@ export default function MomentApp() {
   const favorites = useMemo(() => userPlaylists.find((item) => item.kind === "favorites")?.tracks || [], [userPlaylists]);
   const favoriteKeys = useMemo(() => new Set(favorites.map(songKey)), [favorites]);
   const isFavorite = useCallback((track: Track) => favoriteKeys.has(songKey(track)), [favoriteKeys]);
+  const [blocks, setBlocks] = useState<SongBlock[]>([]);
+  // Same key as the server's logicalTrackKey: artist \0 title, lowercased.
+  const blockedKeys = useMemo(() => new Set(blocks.map((block) => block.song_key)), [blocks]);
+  const isBlocked = useCallback((track: Pick<Track, "title" | "artist">) => blockedKeys.has(`${track.artist.trim().toLowerCase()}\u0000${track.title.trim().toLowerCase()}`), [blockedKeys]);
+  useEffect(() => {
+    fetch(`${apiBase}/api/blocks`).then((response) => response.json()).then((value) => { if (Array.isArray(value.blocks)) setBlocks(value.blocks); }).catch(() => undefined);
+  }, []);
   const topTrack = useMemo(() => tracks.reduce<Track | undefined>((best, track) => ((track.totalPlays || 0) > (best?.totalPlays || 0) ? track : best), undefined), [tracks]);
 
   // Comments of the song that is playing (count on the player bar, list in the panel).
@@ -173,13 +180,13 @@ export default function MomentApp() {
     return () => { window.clearTimeout(first); window.clearInterval(timer); };
   }, [view]);
 
-  const generate = async (override?: string) => {
+  const generate = async (override?: string, variation?: "refresh" | "shift") => {
     const text = (override ?? prompt).trim();
     if (isGenerating || !text) return;
     setIsGenerating(true);
     setNotice("正在理解此刻并挑选歌曲…");
     try {
-      const response = await fetch(`${apiBase}/api/recommendations`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: text, mix, mixMode, count: trackCount }) });
+      const response = await fetch(`${apiBase}/api/recommendations`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: text, mix, mixMode, count: trackCount, ...(variation && playlistMeta.source === "ai" ? { variation, previousId: playlistMeta.id } : {}) }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "生成失败");
       setPlaylist(result.tracks);
@@ -217,8 +224,11 @@ export default function MomentApp() {
     if (!currentTrack) return;
     const queue = playlist.length ? playlist : tracks;
     const index = queue.findIndex((track) => track.id === currentTrack.id);
-    const target = queue[(index + offset + queue.length) % queue.length];
-    if (target) playTrack(target);
+    // Skip songs marked 不喜欢 when moving through a queue.
+    for (let hop = 1; hop <= queue.length; hop += 1) {
+      const target = queue[(index + offset * hop + queue.length * hop) % queue.length];
+      if (target && (target.id === currentTrack.id || !isBlocked(target))) { playTrack(target); return; }
+    }
   };
 
   const toggleTags = async (track: Track) => {
@@ -229,6 +239,22 @@ export default function MomentApp() {
       const tags = await (await fetch(`${apiBase}/api/tracks/${track.id.replace("local-", "")}/tags`)).json() as SongTags;
       setTagCache((cache) => ({ ...cache, [track.id]: tags }));
     } catch { setTagCache((cache) => ({ ...cache, [track.id]: null })); }
+  };
+  const toggleBlock = async (track: Track) => {
+    const blocked = isBlocked(track);
+    try {
+      const response = await fetch(`${apiBase}/api/tracks/${track.id.replace("local-", "")}/block`, { method: blocked ? "DELETE" : "POST" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "操作失败");
+      setBlocks(result.blocks);
+      showNotice(blocked ? "已撤销不喜欢" : `以后不会再推荐《${track.title}》`);
+      if (!blocked && currentTrack?.id === track.id) step(1);
+    } catch (error) { showNotice(error instanceof Error ? error.message : "操作失败"); }
+  };
+  const unblock = async (block: SongBlock) => {
+    const response = await fetch(`${apiBase}/api/blocks?key=${encodeURIComponent(block.song_key)}`, { method: "DELETE" });
+    const result = await response.json();
+    if (response.ok) { setBlocks(result.blocks); showNotice(`已撤销对《${block.title}》的不喜欢`); }
   };
   const toggleFavorite = async (track: Track) => {
     const liked = isFavorite(track);
@@ -387,13 +413,13 @@ export default function MomentApp() {
       {(view === "ai_detail" || view === "user_detail") && <PlaylistView source={playlistMeta.source} title={playlistMeta.title} summary={playlistMeta.summary} request={playlistMeta.request}
         plan={playlistMeta.plan} tracks={playlist} playingId={playingId} isPlaying={isPlaying} isGenerating={isGenerating}
         onPlay={playTrack} onBack={() => setView(playlistMeta.source === "ai" ? "ai_playlists" : "user_playlists")}
-        onRegenerate={() => generate(playlistMeta.request)} onRemove={removeFromPlaylist} handlers={handlers} tagCache={tagCache} />}
+        onRegenerate={(variation) => generate(playlistMeta.request, variation)} onRemove={removeFromPlaylist} handlers={handlers} tagCache={tagCache} />}
       {view === "ai_playlists" && <AiPlaylistsView playlists={savedPlaylists} onOpen={openSavedPlaylist} onDelete={deleteAiPlaylist} onNew={() => { setPrompt(""); setView("home"); }} />}
       {view === "user_playlists" && <UserPlaylistsView playlists={userPlaylists} onOpen={openUserPlaylist} onDelete={deleteUserPlaylist} newName={newPlaylistName} setNewName={setNewPlaylistName} onCreate={createUserPlaylist} />}
       {view === "library" && <LibraryView tracks={tracks} playingId={playingId} isPlaying={isPlaying} onPlay={playTrack} handlers={handlers} tagCache={tagCache} onRescan={rescanLibrary} scanning={libraryStatus === "scanning"} />}
       {view === "history" && <HistoryView history={history} onRefresh={() => setHistoryNonce((value) => value + 1)} tracksById={tracksById} playingId={playingId} isPlaying={isPlaying} onPlay={playTrack} handlers={handlers} tagCache={tagCache} />}
       {view === "journal" && <JournalView tracksById={tracksById} onPlay={playTrack} />}
-      {view === "memory" && <MemoryView memories={memories} recentRequests={recentRequests} favoriteTracks={favorites} onNew={(category) => openMemoryEditor(undefined, category)} onEdit={(memory) => openMemoryEditor(memory)} onDelete={deleteMemory} onPlay={playTrack} />}
+      {view === "memory" && <MemoryView memories={memories} recentRequests={recentRequests} favoriteTracks={favorites} blocks={blocks} onUnblock={unblock} onNew={(category) => openMemoryEditor(undefined, category)} onEdit={(memory) => openMemoryEditor(memory)} onDelete={deleteMemory} onPlay={playTrack} />}
       {view === "eval" && <EvalView status={evalStatus} onStart={startEvalRound} reloadKey={evalFrameKey} tracksById={tracksById}
         playingId={playingId} isPlaying={isPlaying} onPlay={playTrack} handlers={handlers} />}
     </main>
@@ -405,7 +431,7 @@ export default function MomentApp() {
     {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
     <audio ref={audioRef} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
       onDurationChange={(event) => setAudioDuration(event.currentTarget.duration)} onEnded={(event) => { if (playingId) reportListenEvent(playingId, "complete", event.currentTarget.duration); step(1); }} />
-    {currentTrack && <PlayerBar track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={audioDuration} liked={isFavorite(currentTrack)}
+    {currentTrack && <PlayerBar track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={audioDuration} liked={isFavorite(currentTrack)} disliked={isBlocked(currentTrack)} onDislike={() => toggleBlock(currentTrack)}
       commentCount={comments.length} panelOpen={panelOpen} onToggle={() => playTrack(currentTrack)} onPrev={() => step(-1)} onNext={() => step(1)}
       onSeek={(seconds) => { if (audioRef.current) audioRef.current.currentTime = seconds; }} onLike={() => toggleFavorite(currentTrack)} onOpenPanel={() => setPanelOpen((open) => !open)} />}
 

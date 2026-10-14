@@ -241,3 +241,9 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_external_songs_track ON external_songs(t
 db.exec("CREATE INDEX IF NOT EXISTS idx_listening_events_track ON listening_events(track_id, created_at)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_listening_events_external ON listening_events(external_song_id)");
 db.exec("PRAGMA optimize");
+// "不喜欢" from the player: keyed by logical song (title+artist) so every copy of the song is excluded
+// from recommendations, including copies added by a later scan.
+db.exec(`CREATE TABLE IF NOT EXISTS song_blocks (
+  song_key TEXT PRIMARY KEY, track_id INTEGER, title TEXT NOT NULL, artist TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)`);

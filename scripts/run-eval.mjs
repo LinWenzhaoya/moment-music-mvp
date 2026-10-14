@@ -26,7 +26,7 @@ function upsert(entry) {
 async function recommend(prompt, variant, mix) {
   const response = await fetch(`${base}/api/recommendations`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, count, embeddingVariant: variant, ...(mix ? { mix, mixMode: "manual" } : { mixMode: "auto" }) }),
+    body: JSON.stringify({ prompt, count, embeddingVariant: variant, freshness: false, ...(mix ? { mix, mixMode: "manual" } : { mixMode: "auto" }) }),
     signal: AbortSignal.timeout(300_000),
   });
   const body = await response.json();

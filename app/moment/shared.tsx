@@ -33,6 +33,7 @@ const paths: Record<string, string> = {
   plus: "M12 5v14M5 12h14", edit: "M4 20h4L19 9l-4-4L4 16v4zM14 6l4 4", tags: "M4 6h16M4 12h16M4 18h10",
   trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13", close: "M6 6l12 12M18 6L6 18", back: "M15 18l-6-6 6-6",
   refresh: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7", search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3", arrow: "M5 12h14M13 6l6 6-6 6",
+  dislike: "M10 15v4a3 3 0 0 0 3 3l4-9V2H5.7a2 2 0 0 0-2 1.7l-1.4 9A2 2 0 0 0 4.3 15zM17 2h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3", shuffle: "M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5",
   chevronDown: "M6 9l6 6 6-6", chevronUp: "M6 15l6-6 6 6", sliders: "M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0M14 4v4M8 10v4M16 16v4",
 };
 

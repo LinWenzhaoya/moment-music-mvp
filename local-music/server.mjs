@@ -17,6 +17,7 @@ import { buildHistory } from "./history.mjs";
 import { liveCopyIndex, looseKey, remapUnavailableTracks } from "./remap.mjs";
 import { fixIdentity } from "./metadata-fixes.mjs";
 import { handleCommentRoute } from "./comments.mjs";
+import { blockedKeys, blockedRows, blockSong, freshSim, previousPlaylist, recentExposure, shiftAway, unblockSong } from "./freshness.mjs";
 import { isTitleMention, logicalTrackKey, maximalTitleMatches, nearestTitleAfterArtist, normalizeMatch, sanitizeHardStyles } from "./recommendation-core.mjs";
 
 
@@ -123,6 +124,9 @@ function liveCopyOf(row) {
   return id ? db.prepare("SELECT * FROM tracks WHERE id=?").get(id) : null;
 }
 
+let blockedCache = null;
+const isBlocked = (row) => (blockedCache ??= blockedKeys()).has(logicalTrackKey(row));
+
 function serializeTrack(input) {
   const row = input.available === 0 ? liveCopyOf(input) || input : input;
   const missing = row.available === 0;
@@ -136,7 +140,7 @@ function serializeTrack(input) {
     tags, instruments: [], color: ["green", "orange", "violet", "blue", "gold", "cyan"][row.id % 6],
     duration: row.duration, bitrate: bitrateKbps, folder: row.folder,
     playCount: row.play_count, lastPlayedAt: row.last_played_at,
-    audioUrl: missing ? undefined : `http://localhost:${port}/api/tracks/${row.id}/audio`, missing,
+    audioUrl: missing ? undefined : `http://localhost:${port}/api/tracks/${row.id}/audio`, missing, blocked: isBlocked(row),
     ...moodFields(row.id),
   };
 }
@@ -305,7 +309,7 @@ function hardFilteredRows(plan) {
 }
 
 // Coarse recall (relevance only, no personalisation) followed by the programmatic part of fine ranking.
-async function vectorCandidates({ prompt, plan, includedSeeds, excludedSeedIds, count, store, tagsById, targets }) {
+async function vectorCandidates({ prompt, plan, includedSeeds, excludedSeedIds, count, store, tagsById, targets, variation, fresh }) {
   const { base: artistFiltered, hardArtists } = hardFilteredRows(plan);
   // Only audio-tagged songs (those with a vector) can be judged; hard filters run on their v2 tags.
   const tagged = artistFiltered.filter((row) => store.byId.has(row.id));
@@ -313,16 +317,34 @@ async function vectorCandidates({ prompt, plan, includedSeeds, excludedSeedIds, 
   const avoidTerms = (plan.mustAvoid || []).map(normalizeMatch).filter((term) => term.length >= 2);
   const avoidText = (row) => { const tags = tagsById.get(Number(row.id)); return tags ? normalizeMatch([tags.genre.primary, ...tags.genre.sub, ...tags.mood, ...tags.instruments].join(" ")) : ""; };
   const seedKeys = new Set(includedSeeds.map(logicalTrackKey));
+  const blocked = blockedKeys();
+  // 换一批 / 换个口味: never repeat the replaced playlist; 换个口味 also drops its artists.
+  const previousKeys = new Set((variation?.previous?.rows || []).map(logicalTrackKey));
+  const previousArtists = variation?.mode === "shift" && !hardArtists.length ? new Set(variation.previous.rows.flatMap((row) => splitArtists(row.artist))) : new Set();
   const eligible = base.filter((row) => !excludedSeedIds.has(Number(row.id)) && !seedKeys.has(logicalTrackKey(row))
+    && !blocked.has(logicalTrackKey(row)) && !previousKeys.has(logicalTrackKey(row))
+    && !splitArtists(row.artist).some((artist) => previousArtists.has(artist))
     && !avoidTerms.some((term) => avoidText(row).includes(term)));
   const referenceVectors = includedSeeds.map((row) => store.byId.get(row.id)).filter(Boolean);
-  const queryVector = blendWithReferences(await embedQuery(prompt), referenceVectors, rankingConfig.recall.referenceBlend);
+  let queryVector = blendWithReferences(await embedQuery(prompt), referenceVectors, rankingConfig.recall.referenceBlend);
+  if (variation?.mode === "shift") {
+    const previousVectors = variation.previous.rows.map((row) => store.byId.get(row.id)).filter(Boolean);
+    queryVector = shiftAway(queryVector, previousVectors, rankingConfig.freshness.shiftStrength);
+  }
+  const exposure = fresh ? recentExposure(rankingConfig.freshness) : new Map();
   const limit = recallSize(count, rankingConfig.recall);
   const artistCap = hardArtists.length ? Infinity : 4;
   const artistCounts = new Map();
   const profile = getUserProfile(store);
+  // Recently recommended songs sink a little (decaying with age) and a small jitter rotates near-ties,
+  // so the same request does not keep returning the same playlist.
   const ranked = searchTopN(queryVector, eligible, store, eligible.length)
-    .map((item) => ({ ...item, id: Number(item.row.id), bucket: familiarityForRow(item.row, profile) }));
+    .map((item) => {
+      const seen = exposure.get(logicalTrackKey(item.row)) || 0;
+      return { ...item, rawSim: item.querySim, exposure: seen, querySim: fresh ? freshSim(item.querySim, seen, rankingConfig.freshness) : item.querySim,
+        id: Number(item.row.id), bucket: familiarityForRow(item.row, profile) };
+    })
+    .sort((left, right) => right.querySim - left.querySim);
   const recalled = stratifiedRecall(ranked, (item) => item.bucket, targets, limit, {
     accept: (item) => {
       const artists = splitArtists(item.row.artist);
@@ -332,10 +354,11 @@ async function vectorCandidates({ prompt, plan, includedSeeds, excludedSeedIds, 
     },
   });
   const scored = scoreCandidates(recalled.map((item) => ({
-    id: Number(item.row.id), row: item.row, querySim: item.querySim,
+    id: Number(item.row.id), row: item.row, querySim: item.querySim, rawSim: item.rawSim, exposure: item.exposure,
     personal: personalSignals(item.row, item.vector, profile), bucket: item.bucket,
   })), rankingConfig);
-  return { scored, profile, eligibleCount: eligible.length, taggedCount: tagged.length, relaxed, referenceCount: referenceVectors.length };
+  return { scored, profile, eligibleCount: eligible.length, taggedCount: tagged.length, relaxed, referenceCount: referenceVectors.length,
+    blockedCount: blocked.size, recentlyRecommended: exposure.size };
 }
 
 const round3 = (value) => (Number.isFinite(value) ? Math.round(value * 1000) / 1000 : null);
@@ -409,7 +432,11 @@ referenceTracks必须覆盖所有识别出的参考歌，不得填写 referenced
   const excludedSeedIds = new Set(references.filter((item) => item.policy === "exclude").map((item) => Number(item.row.id)));
   const pipeline = { retrieval: "vector", embeddingVariant: variant, queryText: prompt, hardFilters: planning.value.hardFilters, mix };
   const targets = mixTargets(mix, Math.max(0, count - includedSeeds.length));
-  const { scored, profile, eligibleCount, taggedCount, relaxed, referenceCount } = await vectorCandidates({ prompt, plan: planning.value, includedSeeds, excludedSeedIds, count, store, tagsById, targets });
+  const previous = options.variation ? previousPlaylist(Number(options.previousId)) : null;
+  const variation = previous ? { mode: options.variation === "shift" ? "shift" : "refresh", previous } : null;
+  const fresh = options.freshness !== false;
+  const { scored, profile, eligibleCount, taggedCount, relaxed, referenceCount, blockedCount, recentlyRecommended } = await vectorCandidates({ prompt, plan: planning.value, includedSeeds, excludedSeedIds, count, store, tagsById, targets, variation, fresh });
+  Object.assign(pipeline, { variation: variation ? { mode: variation.mode, previousId: previous.id } : null, freshness: fresh, blockedSongs: blockedCount, recentlyRecommended });
   pipeline.taggedSongs = taggedCount;
   pipeline.relaxedFilters = relaxed;
   const candidateEntries = [
@@ -420,7 +447,7 @@ referenceTracks必须覆盖所有识别出的参考歌，不得填写 referenced
   pipeline.referenceVectorsBlended = referenceCount;
   pipeline.clusters = profile.clusters ? { k: profile.clusters.k, silhouette: round3(profile.clusters.silhouette), songCount: profile.clusters.songCount } : null;
   pipeline.recalled = scored.map((item) => ({ id: item.id, title: item.row.title, artist: item.row.artist, bucket: item.bucket,
-    querySim: round3(item.querySim), personalScore: round3(item.personalScore), total: round3(item.total) }));
+    querySim: round3(item.rawSim), freshSim: round3(item.querySim), exposure: round3(item.exposure), personalScore: round3(item.personalScore), total: round3(item.total) }));
   const candidates = candidateEntries.map((entry) => entry.row);
   if (!candidateEntries.length) throw new Error("没有找到满足硬条件的本地歌曲");
   const candidatePayload = candidateEntries.map(({ row, tier, item }) => ({
@@ -437,6 +464,14 @@ retrievalPlan.hardFilters 已由程序严格执行，候选都满足；用户明
     retrievalPlan: planning.value, longTermMemories: memories, favoriteTracks,
     recentSessionFeedback: recentFeedback,
     referenceTracksToKeep: includedSeeds.map((row) => ({ id: row.id, title: row.title, artist: row.artist })),
+    ...(variation ? { variation: {
+      mode: variation.mode,
+      instruction: variation.mode === "shift"
+        ? "用户对上一版点了「换个口味」：保持同样的情绪和场景，但换一种声音方向（曲风、语言、年代、编制至少有一项明显不同），标题也要体现新的方向。"
+        : "用户对上一版点了「换一批」：同样的需求，换一批不同的歌，标题不要与上一版重复。",
+      previousTitle: previous.title,
+      previousSongs: previous.rows.slice(0, 20).map((row) => ({ title: row.title, artist: row.artist, genre: tagsById.get(Number(row.id))?.genre?.primary || null })),
+    } } : {}),
   };
   let rankingTokens = 0;
   const payloadById = new Map(candidatePayload.map((item) => [Number(item.id), item]));
@@ -665,13 +700,33 @@ const server = createServer(async (request, response) => {
       const requestLog = db.prepare("INSERT INTO request_logs (request_text, requested_count, mix_json) VALUES (?, ?, ?)").run(requestText, count, JSON.stringify(mix));
       const requestLogId = Number(requestLog.lastInsertRowid);
       try {
-        const recommendation = await generateRecommendation(requestText, mix, count, seedTrackIds, { embeddingVariant: body.embeddingVariant });
+        const recommendation = await generateRecommendation(requestText, mix, count, seedTrackIds, {
+          embeddingVariant: body.embeddingVariant, freshness: body.freshness,
+          variation: ["refresh", "shift"].includes(body.variation) ? body.variation : null, previousId: body.previousId,
+        });
         db.prepare("UPDATE request_logs SET status='succeeded', recommendation_id=?, completed_at=CURRENT_TIMESTAMP WHERE id=?").run(recommendation.id, requestLogId);
         return sendJson(response, 200, recommendation);
       } catch (error) {
         db.prepare("UPDATE request_logs SET status='failed', error_text=?, completed_at=CURRENT_TIMESTAMP WHERE id=?").run(String(error instanceof Error ? error.message : error).slice(0, 500), requestLogId);
         throw error;
       }
+    }
+    if (request.method === "GET" && url.pathname === "/api/blocks") {
+      return sendJson(response, 200, { blocks: blockedRows() });
+    }
+    const blockMatch = url.pathname.match(/^\/api\/tracks\/(\d+)\/block$/);
+    if (blockMatch && (request.method === "POST" || request.method === "DELETE")) {
+      const row = db.prepare("SELECT id, title, artist FROM tracks WHERE id=?").get(Number(blockMatch[1]));
+      if (!row) return sendJson(response, 404, { error: "歌曲不存在" });
+      if (request.method === "POST") blockSong(row); else unblockSong(row);
+      blockedCache = null;
+      return sendJson(response, 200, { ok: true, blocked: request.method === "POST", blocks: blockedRows() });
+    }
+    const unblockKeyMatch = request.method === "DELETE" && url.pathname === "/api/blocks" ? url.searchParams.get("key") : null;
+    if (unblockKeyMatch) {
+      db.prepare("DELETE FROM song_blocks WHERE song_key=?").run(unblockKeyMatch);
+      blockedCache = null;
+      return sendJson(response, 200, { ok: true, blocks: blockedRows() });
     }
     if (request.method === "GET" && url.pathname === "/api/playlists") {
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));

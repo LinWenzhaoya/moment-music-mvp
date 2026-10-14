@@ -13,16 +13,18 @@ export function MoodTag({ mood }: { mood: string | null }) {
   return <span className={`mood-tag tone-${index >= 0 ? index : "x"}`}>{mood}</span>;
 }
 
-export function PlayerBar({ track, isPlaying, currentTime, duration, liked, commentCount, panelOpen, onToggle, onPrev, onNext, onSeek, onLike, onOpenPanel }: {
-  track: Track; isPlaying: boolean; currentTime: number; duration: number; liked: boolean; commentCount: number; panelOpen: boolean;
-  onToggle: () => void; onPrev: () => void; onNext: () => void; onSeek: (seconds: number) => void; onLike: () => void; onOpenPanel: () => void;
+export function PlayerBar({ track, isPlaying, currentTime, duration, liked, disliked, commentCount, panelOpen, onToggle, onPrev, onNext, onSeek, onLike, onDislike, onOpenPanel }: {
+  track: Track; isPlaying: boolean; currentTime: number; duration: number; liked: boolean; disliked: boolean; commentCount: number; panelOpen: boolean;
+  onToggle: () => void; onPrev: () => void; onNext: () => void; onSeek: (seconds: number) => void; onLike: () => void; onDislike: () => void; onOpenPanel: () => void;
 }) {
   const total = duration || track.duration || 0;
   return <footer className="player-bar">
     <div className="player-now">
       <MoodCover track={track} size={56} />
       <div className="player-text"><span className="player-title">{track.title}</span><span className="player-sub">{track.artist}<Chips items={track.chips} max={2} /></span></div>
-      <button className={`icon-button ${liked ? "liked" : ""}`} onClick={onLike} aria-label={liked ? "取消收藏" : "收藏"}><Icon name="heart" size={20} filled={liked} /></button>
+      <button className={`icon-button ${liked ? "liked" : ""}`} onClick={onLike} aria-label={liked ? "取消收藏" : "收藏"} title={liked ? "取消收藏" : "收藏"}><Icon name="heart" size={20} filled={liked} /></button>
+      <button className={`icon-button ${disliked ? "disliked" : ""}`} onClick={onDislike} aria-pressed={disliked}
+        aria-label={disliked ? "撤销不喜欢" : "不喜欢，以后不再推荐"} title={disliked ? "撤销不喜欢" : "不喜欢：以后不再推荐，并跳到下一首"}><Icon name="dislike" size={19} /></button>
     </div>
     <div className="player-center">
       <div className="transport">
