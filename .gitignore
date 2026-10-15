@@ -65,3 +65,4 @@ local-music/*.db-wal
 /local-music/batch-jobs.json
 tsconfig.tsbuildinfo
 /local-music/backups/
+local-music/.db-sync.json

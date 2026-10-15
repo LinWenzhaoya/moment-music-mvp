@@ -1,0 +1,1 @@
+# ossutil cp -r -u -f -j 8 --checkpoint-dir /Users/jyxc-dz-0101494/.ossutil-checkpoint --region cn-hongkong -e oss-cn-hongkong.aliyuncs.com /Users/jyxc-dz-0101494/Documents/music/曲库/ oss://moment-music-lin2026/曲库/
