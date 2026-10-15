@@ -66,3 +66,4 @@ local-music/*.db-wal
 tsconfig.tsbuildinfo
 /local-music/backups/
 local-music/.db-sync.json
+/ossutil_output/
